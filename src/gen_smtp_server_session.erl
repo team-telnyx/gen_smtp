@@ -81,8 +81,8 @@
     envelope = undefined :: 'undefined' | #envelope{},
     extensions = [] :: [{string(), string()}],
     maxsize = ?DEFAULT_MAXSIZE :: pos_integer() | 'infinity',
-    command_timeout = ?DEFAULT_TIMEOUT :: pos_integer(),
-    data_timeout = ?DEFAULT_TIMEOUT :: pos_integer(),
+    command_timeout = ?DEFAULT_TIMEOUT :: non_neg_integer() | 'infinity',
+    data_timeout = ?DEFAULT_TIMEOUT :: non_neg_integer() | 'infinity',
     waitingauth = false :: 'false' | 'plain' | 'login' | 'cram-md5',
     authdata :: 'undefined' | binary(),
     readmessage = false :: boolean(),
@@ -101,9 +101,10 @@
     % deprecated, see tls_options
     | {keyfile, file:name_all()}
     | {allow_bare_newlines, false | ignore | fix | strip}
-    | {auth_required_reply, string()}
-    | {command_timeout, pos_integer()}
-    | {data_timeout, pos_integer()}
+    | {auth_required_reply, string() | binary()}
+    %% `infinity' is explicitly accepted and disables the timeout.
+    | {command_timeout, non_neg_integer() | 'infinity'}
+    | {data_timeout, non_neg_integer() | 'infinity'}
     | {hostname, inet:hostname()}
     | {protocol, smtp | lmtp}
     | {tls_options, [tls_opt()]}
@@ -202,9 +203,59 @@ ranch_init({Ref, Transport, {Callback, Opts}}) ->
 %% @private
 -spec init(Args :: list()) -> {'ok', #state{}, timeout()} | {'stop', any()} | 'ignore'.
 init([Ref, Transport, Socket, Module, Options]) ->
+    case validate_session_options(Options) of
+        {error, Key} ->
+            Transport:close(Socket),
+            {stop, {invalid_option, Key}};
+        ok ->
+            init_session(Ref, Transport, Socket, Module, Options)
+    end.
+
+%% Validate the sessionoptions this module consumes before serving a session:
+%% server configuration errors must fail the session at init with
+%% `{stop, {invalid_option, Key}}' instead of crashing later on the wire.
+validate_session_options(Options) ->
+    CommandTimeout = proplists:get_value(command_timeout, Options, ?DEFAULT_TIMEOUT),
+    DataTimeout = proplists:get_value(data_timeout, Options, ?DEFAULT_TIMEOUT),
+    case {valid_timeout(CommandTimeout), valid_timeout(DataTimeout)} of
+        {false, _} ->
+            {error, command_timeout};
+        {_, false} ->
+            {error, data_timeout};
+        _ ->
+            case auth_required_reply(Options) of
+                error -> {error, auth_required_reply};
+                _Reply -> ok
+            end
+    end.
+
+%% The reply sent when AUTH is not advertised, normalized once at session init
+%% to a UTF-8 binary so it can be sent safely. Returns `error' unless the
+%% reply is a bounded single-line SMTP error reply beginning with a 3-digit
+%% reply code.
+auth_required_reply(Options) ->
+    RawReply = proplists:get_value(auth_required_reply, Options, "502 Error: AUTH not implemented"),
+    case normalize_reply(RawReply) of
+        Reply when is_binary(Reply), byte_size(Reply) =< 512 ->
+            case {is_smtp_reply_code(Reply), has_forbidden_reply_char(Reply)} of
+                {true, false} -> Reply;
+                _ -> error
+            end;
+        _ ->
+            error
+    end.
+
+init_session(Ref, Transport, Socket, Module, Options) ->
     Protocol = proplists:get_value(protocol, Options, smtp),
     CommandTimeout = proplists:get_value(command_timeout, Options, ?DEFAULT_TIMEOUT),
     DataTimeout = proplists:get_value(data_timeout, Options, ?DEFAULT_TIMEOUT),
+    Options1 = [
+        {auth_required_reply, auth_required_reply(Options)}
+        | proplists:delete(
+            auth_required_reply,
+            Options
+        )
+    ],
     PeerName =
         case Transport:peername(Socket) of
             {ok, {IPaddr, _Port}} -> IPaddr;
@@ -239,7 +290,7 @@ init([Ref, Transport, Socket, Module, Options]) ->
                     protocol = Protocol,
                     command_timeout = CommandTimeout,
                     data_timeout = DataTimeout,
-                    options = Options,
+                    options = Options1,
                     callbackstate = CallbackState
                 },
                 CommandTimeout};
@@ -255,6 +306,12 @@ init([Ref, Transport, Socket, Module, Options]) ->
 command_timeout(#state{command_timeout = Timeout}) -> Timeout.
 
 data_timeout(#state{data_timeout = Timeout}) -> Timeout.
+
+%% `infinity' disables the DATA wall-clock budget.
+data_deadline(infinity) ->
+    infinity;
+data_deadline(DataTimeout) ->
+    erlang:monotonic_time(millisecond) + DataTimeout.
 
 %% @hidden
 handle_call(stop, _From, State) ->
@@ -339,7 +396,7 @@ handle_info(
             Session = self(),
             Size = 0,
             DataTimeout = data_timeout(NewState),
-            DataDeadline = erlang:monotonic_time(millisecond) + DataTimeout,
+            DataDeadline = data_deadline(DataTimeout),
             setopts(NewState, [{packet, raw}]),
             %% TODO: change to receive asynchronously in the same process
             spawn_opt(
@@ -571,9 +628,7 @@ handle_request(
 
     case has_extension(Extensions, "AUTH") of
         false ->
-            AuthRequiredReply = proplists:get_value(
-                auth_required_reply, Options, "502 Error: AUTH not implemented"
-            ),
+            AuthRequiredReply = auth_required_reply(Options),
             send(State, [AuthRequiredReply, "\r\n"]),
             {ok, State};
         {true, AvailableTypes} ->
@@ -604,7 +659,15 @@ handle_request(
                         <<"PLAIN">> when Parameters =/= false ->
                             case decode_auth_line(Parameters) of
                                 {ok, Decoded} ->
-                                    handle_sasl(Decoded, State#state{waitingauth = 'plain'});
+                                    case parse_plain_auth(Decoded) of
+                                        {ok, Username, Password} ->
+                                            try_auth('plain', Username, Password, State);
+                                        error ->
+                                            reject_auth(
+                                                "501 Authentication line too long / invalid\r\n",
+                                                State
+                                            )
+                                    end;
                                 error ->
                                     reject_auth(
                                         "501 Authentication line too long / invalid\r\n", State
@@ -992,6 +1055,17 @@ decode_auth_line(Line) ->
         _:_ -> error
     end.
 
+%% Decodes a decoded SASL PLAIN message into its username and password fields.
+%% Any existing envelope auth state is irrelevant: RFC 4954 allows a client to
+%% re-issue AUTH on a session that already authenticated, so the PLAIN fields
+%% must be parsed before the SASL continuation state is consulted.
+parse_plain_auth(Plain) ->
+    case binstr:split(Plain, <<0>>) of
+        [_Identity, Username, Password] -> {ok, Username, Password};
+        [Username, Password] -> {ok, Username, Password};
+        _ -> error
+    end.
+
 reject_auth(Message, State) ->
     send(State, Message),
     {ok, clear_sasl_state(State)}.
@@ -1005,12 +1079,14 @@ clear_sasl_state(#state{envelope = #envelope{} = Envelope} = State) ->
 clear_sasl_state(State) ->
     State#state{waitingauth = false, authdata = undefined}.
 
+%% RFC 1870: the SIZE parameter value is a sequence of digits. Signed text
+%% such as "+1" or "-0" is a syntax error, not a number.
+parse_size(<<>>) ->
+    error;
 parse_size(Size) ->
-    try binary_to_integer(Size) of
-        ParsedSize when ParsedSize >= 0 -> {ok, ParsedSize};
-        _ -> error
-    catch
-        _:_ -> error
+    case re:run(Size, "^[0-9]+$") of
+        {match, _} -> {ok, binary_to_integer(Size)};
+        nomatch -> error
     end.
 
 %% @doc handle SASL client response to `334' challenge - RFC-4954
@@ -1027,15 +1103,11 @@ handle_sasl(
             reject_auth("501 Authentication line too long / invalid\r\n", State)
     end;
 % the client sends a \0username\0password response to auth-plain
-handle_sasl(
-    UserPass, #state{waitingauth = 'plain', envelope = #envelope{auth = {<<>>, <<>>}}} = State
-) ->
-    case binstr:split(UserPass, <<0>>) of
-        [_Identity, Username, Password] ->
+handle_sasl(UserPass, #state{waitingauth = 'plain'} = State) ->
+    case parse_plain_auth(UserPass) of
+        {ok, Username, Password} ->
             try_auth('plain', Username, Password, State);
-        [Username, Password] ->
-            try_auth('plain', Username, Password, State);
-        _ ->
+        error ->
             reject_auth("501 Authentication line too long / invalid\r\n", State)
     end;
 % the client sends a username response to auth-login
@@ -1230,6 +1302,14 @@ receive_data(_Acc, _Transport, _Socket, _, Size, MaxSize, Session, _Options, _De
 ->
     ?LOG_INFO("SMTP message body size ~B exceeded maximum allowed ~B", [Size, MaxSize], ?LOGGER_META),
     Session ! {receive_data, {error, size_exceeded}};
+receive_data(
+    Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, infinity
+) ->
+    %% `infinity' data_timeout disables the wall-clock budget; wait in bounded
+    %% slices so socket errors still surface promptly.
+    receive_data_before_deadline(
+        Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, infinity, 1000
+    );
 receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline) ->
     Remaining = Deadline - erlang:monotonic_time(millisecond),
     case Remaining =< 0 of
@@ -1492,6 +1572,43 @@ setopts(#state{transport = Transport, socket = Sock} = St, Opts) ->
 
 hostname(Opts) ->
     proplists:get_value(hostname, Opts, smtp_util:guess_FQDN()).
+
+%% OTP timers accept millisecond integers up to 4294967295, or the atom
+%% `infinity' for no timeout. Zero is valid and expires immediately.
+valid_timeout(infinity) -> true;
+valid_timeout(Value) when is_integer(Value), Value >= 0, Value =< 4294967295 -> true;
+valid_timeout(_) -> false.
+
+%% The reply is normalized to a UTF-8 binary. Strings, binaries and anything
+%% that is not a valid UTF-8 binary (invalid UTF-8, atoms, lists with
+%% non-printable integers) are rejected.
+normalize_reply(Reply) when is_binary(Reply) ->
+    case unicode:characters_to_binary(Reply) of
+        Reply -> Reply;
+        _ -> error
+    end;
+normalize_reply(Reply) when is_list(Reply) ->
+    case unicode:characters_to_binary(Reply) of
+        Binary when is_binary(Binary) -> Binary;
+        _ -> error
+    end;
+normalize_reply(_) ->
+    error.
+
+has_forbidden_reply_char(Reply) ->
+    lists:any(fun is_forbidden_reply_char/1, unicode:characters_to_list(Reply)).
+
+is_forbidden_reply_char($\r) -> true;
+is_forbidden_reply_char($\n) -> true;
+is_forbidden_reply_char(0) -> true;
+is_forbidden_reply_char(_) -> false.
+
+is_smtp_reply_code(<<C1, C2, C3, $\s, _/binary>>) when
+    C1 >= $0, C1 =< $9, C2 >= $0, C2 =< $9, C3 >= $0, C3 =< $9
+->
+    true;
+is_smtp_reply_code(_) ->
+    false.
 
 %% @hidden
 lhlo_if_lmtp(Protocol, Fallback) ->
