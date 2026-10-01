@@ -43,7 +43,7 @@
     {"SMTPUTF8", true}
 ]).
 % 3 minutes
--define(TIMEOUT, 180000).
+-define(DEFAULT_TIMEOUT, 180000).
 
 %% External API
 -export([start_link/3, start_link/4]).
@@ -81,6 +81,8 @@
     envelope = undefined :: 'undefined' | #envelope{},
     extensions = [] :: [{string(), string()}],
     maxsize = ?DEFAULT_MAXSIZE :: pos_integer() | 'infinity',
+    command_timeout = ?DEFAULT_TIMEOUT :: non_neg_integer() | 'infinity',
+    data_timeout = ?DEFAULT_TIMEOUT :: non_neg_integer() | 'infinity',
     waitingauth = false :: 'false' | 'plain' | 'login' | 'cram-md5',
     authdata :: 'undefined' | binary(),
     readmessage = false :: boolean(),
@@ -99,6 +101,10 @@
     % deprecated, see tls_options
     | {keyfile, file:name_all()}
     | {allow_bare_newlines, false | ignore | fix | strip}
+    | {auth_required_reply, string() | binary()}
+    %% `infinity' is explicitly accepted and disables the timeout.
+    | {command_timeout, non_neg_integer() | 'infinity'}
+    | {data_timeout, non_neg_integer() | 'infinity'}
     | {hostname, inet:hostname()}
     | {protocol, smtp | lmtp}
     | {tls_options, [tls_opt()]}
@@ -195,9 +201,61 @@ ranch_init({Ref, Transport, {Callback, Opts}}) ->
     end.
 
 %% @private
--spec init(Args :: list()) -> {'ok', #state{}, ?TIMEOUT} | {'stop', any()} | 'ignore'.
+-spec init(Args :: list()) -> {'ok', #state{}, timeout()} | {'stop', any()} | 'ignore'.
 init([Ref, Transport, Socket, Module, Options]) ->
+    case validate_session_options(Options) of
+        {error, Key} ->
+            Transport:close(Socket),
+            {stop, {invalid_option, Key}};
+        ok ->
+            init_session(Ref, Transport, Socket, Module, Options)
+    end.
+
+%% Validate the sessionoptions this module consumes before serving a session:
+%% server configuration errors must fail the session at init with
+%% `{stop, {invalid_option, Key}}' instead of crashing later on the wire.
+validate_session_options(Options) ->
+    CommandTimeout = proplists:get_value(command_timeout, Options, ?DEFAULT_TIMEOUT),
+    DataTimeout = proplists:get_value(data_timeout, Options, ?DEFAULT_TIMEOUT),
+    case {valid_timeout(CommandTimeout), valid_timeout(DataTimeout)} of
+        {false, _} ->
+            {error, command_timeout};
+        {_, false} ->
+            {error, data_timeout};
+        _ ->
+            case auth_required_reply(Options) of
+                error -> {error, auth_required_reply};
+                _Reply -> ok
+            end
+    end.
+
+%% The reply sent when AUTH is not advertised, normalized once at session init
+%% to a UTF-8 binary so it can be sent safely. Returns `error' unless the
+%% reply is a bounded single-line SMTP error reply beginning with a 3-digit
+%% reply code.
+auth_required_reply(Options) ->
+    RawReply = proplists:get_value(auth_required_reply, Options, "502 Error: AUTH not implemented"),
+    case normalize_reply(RawReply) of
+        Reply when is_binary(Reply), byte_size(Reply) =< 512 ->
+            case {is_smtp_reply_code(Reply), has_forbidden_reply_char(Reply)} of
+                {true, false} -> Reply;
+                _ -> error
+            end;
+        _ ->
+            error
+    end.
+
+init_session(Ref, Transport, Socket, Module, Options) ->
     Protocol = proplists:get_value(protocol, Options, smtp),
+    CommandTimeout = proplists:get_value(command_timeout, Options, ?DEFAULT_TIMEOUT),
+    DataTimeout = proplists:get_value(data_timeout, Options, ?DEFAULT_TIMEOUT),
+    Options1 = [
+        {auth_required_reply, auth_required_reply(Options)}
+        | proplists:delete(
+            auth_required_reply,
+            Options
+        )
+    ],
     PeerName =
         case Transport:peername(Socket) of
             {ok, {IPaddr, _Port}} -> IPaddr;
@@ -230,10 +288,12 @@ init([Ref, Transport, Socket, Module, Options]) ->
                     module = Module,
                     ranch_ref = Ref,
                     protocol = Protocol,
-                    options = Options,
+                    command_timeout = CommandTimeout,
+                    data_timeout = DataTimeout,
+                    options = Options1,
                     callbackstate = CallbackState
                 },
-                ?TIMEOUT};
+                CommandTimeout};
         {stop, Reason, Message} ->
             Transport:send(Socket, [Message, "\r\n"]),
             Transport:close(Socket),
@@ -242,6 +302,16 @@ init([Ref, Transport, Socket, Module, Options]) ->
             Transport:close(Socket),
             ignore
     end.
+
+command_timeout(#state{command_timeout = Timeout}) -> Timeout.
+
+data_timeout(#state{data_timeout = Timeout}) -> Timeout.
+
+%% `infinity' disables the DATA wall-clock budget.
+data_deadline(infinity) ->
+    infinity;
+data_deadline(DataTimeout) ->
+    erlang:monotonic_time(millisecond) + DataTimeout.
 
 %% @hidden
 handle_call(stop, _From, State) ->
@@ -260,12 +330,16 @@ handle_info({receive_data, {error, size_exceeded}}, #state{readmessage = true} =
     send(State, "552 Message too large\r\n"),
     setopts(State, [{active, once}]),
     State1 = handle_error(data_rejected, size_exceeded, State),
-    {noreply, State1#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT};
+    {noreply, State1#state{readmessage = false, envelope = #envelope{}}, command_timeout(State1)};
 handle_info({receive_data, {error, bare_newline}}, #state{readmessage = true} = State) ->
     send(State, "451 Bare newline detected\r\n"),
     setopts(State, [{active, once}]),
     State1 = handle_error(data_rejected, bare_neline, State),
-    {noreply, State1#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT};
+    {noreply, State1#state{readmessage = false, envelope = #envelope{}}, command_timeout(State1)};
+handle_info({receive_data, {error, data_timeout}}, #state{readmessage = true} = State) ->
+    send(State, "421 Error: timeout exceeded\r\n"),
+    State1 = handle_error(timeout, data, State),
+    {stop, normal, State1};
 handle_info({receive_data, {error, Other}}, #state{readmessage = true} = State) ->
     State1 = handle_error(data_receive_error, Other, State),
     {stop, {error_receiving_data, Other}, State1};
@@ -304,12 +378,12 @@ handle_info(
                     envelope = #envelope{},
                     callbackstate = CallbackState
                 },
-                ?TIMEOUT};
+                command_timeout(State)};
         false ->
             send(State, "552 Message too large\r\n"),
             setopts(State, [{active, once}]),
             % might not even be able to get here anymore...
-            {noreply, State#state{readmessage = false, envelope = #envelope{}}, ?TIMEOUT}
+            {noreply, State#state{readmessage = false, envelope = #envelope{}}, command_timeout(State)}
     end;
 handle_info(
     {SocketType, Socket, Packet},
@@ -321,18 +395,30 @@ handle_info(
         {ok, #state{options = Options, readmessage = true, maxsize = MaxSize} = NewState} ->
             Session = self(),
             Size = 0,
+            DataTimeout = data_timeout(NewState),
+            DataDeadline = data_deadline(DataTimeout),
             setopts(NewState, [{packet, raw}]),
             %% TODO: change to receive asynchronously in the same process
             spawn_opt(
                 fun() ->
-                    receive_data([], Transport, Socket, 0, Size, MaxSize, Session, Options)
+                    receive_data(
+                        [],
+                        Transport,
+                        Socket,
+                        0,
+                        Size,
+                        MaxSize,
+                        Session,
+                        Options,
+                        DataDeadline
+                    )
                 end,
                 [link, {fullsweep_after, 0}]
             ),
-            {noreply, NewState, ?TIMEOUT};
+            {noreply, NewState, DataTimeout};
         {ok, NewState} ->
             setopts(NewState, [{active, once}]),
-            {noreply, NewState, ?TIMEOUT};
+            {noreply, NewState, command_timeout(NewState)};
         {stop, Reason, NewState} ->
             {stop, Reason, NewState}
     end;
@@ -346,9 +432,20 @@ handle_info({SocketType, Socket, Packet}, #state{socket = Socket} = State) when
         $\s
     ),
     ?LOG_DEBUG("Got SASL request ~p", [Request], ?LOGGER_META),
-    {ok, NewState} = handle_sasl(base64:decode(Request), State),
+    {ok, NewState} =
+        case Request of
+            <<"*">> ->
+                reject_auth("501 Authentication aborted\r\n", State);
+            _ ->
+                case decode_auth_line(Request) of
+                    {ok, Decoded} ->
+                        handle_sasl(Decoded, State);
+                    error ->
+                        reject_auth("501 Authentication line too long / invalid\r\n", State)
+                end
+        end,
     setopts(NewState, [{active, once}]),
-    {noreply, NewState, ?TIMEOUT};
+    {noreply, NewState, command_timeout(NewState)};
 handle_info({Kind, _Socket}, State) when
     Kind == tcp_closed;
     Kind == ssl_closed
@@ -379,7 +476,7 @@ handle_info(Info, #state{module = Module, callbackstate = OldCallbackState} = St
             end;
         false ->
             ?LOG_DEBUG("Ignored message ~p", [Info], ?LOGGER_META),
-            {noreply, State, ?TIMEOUT}
+            {noreply, State, command_timeout(State)}
     end.
 
 %% @hidden
@@ -531,7 +628,8 @@ handle_request(
 
     case has_extension(Extensions, "AUTH") of
         false ->
-            send(State, "502 Error: AUTH not implemented\r\n"),
+            AuthRequiredReply = auth_required_reply(Options),
+            send(State, [AuthRequiredReply, "\r\n"]),
             {ok, State};
         {true, AvailableTypes} ->
             case
@@ -552,16 +650,28 @@ handle_request(
                                 waitingauth = 'login',
                                 envelope = Envelope#envelope{auth = {<<>>, <<>>}}
                             }};
+                        <<"PLAIN">> when Parameters =:= <<"=">> ->
+                            send(State, "334\r\n"),
+                            {ok, State#state{
+                                waitingauth = 'plain',
+                                envelope = Envelope#envelope{auth = {<<>>, <<>>}}
+                            }};
                         <<"PLAIN">> when Parameters =/= false ->
-                            % TODO - duplicated below in handle_request waitingauth PLAIN
-                            case binstr:split(base64:decode(Parameters), <<0>>) of
-                                [_Identity, Username, Password] ->
-                                    try_auth('plain', Username, Password, State);
-                                [Username, Password] ->
-                                    try_auth('plain', Username, Password, State);
-                                _ ->
-                                    % TODO error
-                                    {ok, State}
+                            case decode_auth_line(Parameters) of
+                                {ok, Decoded} ->
+                                    case parse_plain_auth(Decoded) of
+                                        {ok, Username, Password} ->
+                                            try_auth('plain', Username, Password, State);
+                                        error ->
+                                            reject_auth(
+                                                "501 Authentication line too long / invalid\r\n",
+                                                State
+                                            )
+                                    end;
+                                error ->
+                                    reject_auth(
+                                        "501 Authentication line too long / invalid\r\n", State
+                                    )
                             end;
                         <<"PLAIN">> ->
                             send(State, "334\r\n"),
@@ -644,18 +754,15 @@ handle_request(
                                 (
                                     <<"SIZE=", Size/binary>>,
                                     #state{envelope = Envelope} = InnerState
-                                ) when MaxSize =:= 'infinity' ->
-                                    InnerState#state{
-                                        envelope = Envelope#envelope{
-                                            expectedsize = binary_to_integer(Size)
-                                        }
-                                    };
-                                (
-                                    <<"SIZE=", Size/binary>>,
-                                    #state{envelope = Envelope} = InnerState
                                 ) ->
-                                    case binary_to_integer(Size) > MaxSize of
-                                        true ->
+                                    case parse_size(Size) of
+                                        {ok, ParsedSize} when MaxSize =:= 'infinity' ->
+                                            InnerState#state{
+                                                envelope = Envelope#envelope{
+                                                    expectedsize = ParsedSize
+                                                }
+                                            };
+                                        {ok, ParsedSize} when ParsedSize > MaxSize ->
                                             {error, [
                                                 "552 Estimated message length ",
                                                 Size,
@@ -663,12 +770,14 @@ handle_request(
                                                 integer_to_binary(MaxSize),
                                                 "\r\n"
                                             ]};
-                                        false ->
+                                        {ok, ParsedSize} ->
                                             InnerState#state{
                                                 envelope = Envelope#envelope{
-                                                    expectedsize = binary_to_integer(Size)
+                                                    expectedsize = ParsedSize
                                                 }
-                                            }
+                                            };
+                                        error ->
+                                            {error, "501 Syntax error\r\n"}
                                     end;
                                 (
                                     <<"BODY=", BodyType/binary>>,
@@ -677,13 +786,25 @@ handle_request(
                                 ) ->
                                     case has_extension(Extensions, "8BITMIME") of
                                         {true, _} ->
-                                            Flag = maps:get(BodyType, #{
-                                                <<"8BITMIME">> => '8bitmime',
-                                                <<"7BIT">> => '7bit'
-                                            }),
-                                            InnerState#state{
-                                                envelope = Envelope#envelope{flags = [Flag | Flags]}
-                                            };
+                                            case
+                                                maps:get(
+                                                    BodyType,
+                                                    #{
+                                                        <<"8BITMIME">> => '8bitmime',
+                                                        <<"7BIT">> => '7bit'
+                                                    },
+                                                    undefined
+                                                )
+                                            of
+                                                undefined ->
+                                                    {error, "555 Unsupported option BODY\r\n"};
+                                                Flag ->
+                                                    InnerState#state{
+                                                        envelope = Envelope#envelope{
+                                                            flags = [Flag | Flags]
+                                                        }
+                                                    }
+                                            end;
                                         false ->
                                             {error, "555 Unsupported option BODY\r\n"}
                                     end;
@@ -927,6 +1048,47 @@ handle_request({Verb, Args}, #state{module = Module, callbackstate = OldCallback
         end,
     {ok, State#state{callbackstate = CallbackState}}.
 
+decode_auth_line(Line) ->
+    try base64:decode(Line) of
+        Decoded -> {ok, Decoded}
+    catch
+        _:_ -> error
+    end.
+
+%% Decodes a decoded SASL PLAIN message into its username and password fields.
+%% Any existing envelope auth state is irrelevant: RFC 4954 allows a client to
+%% re-issue AUTH on a session that already authenticated, so the PLAIN fields
+%% must be parsed before the SASL continuation state is consulted.
+parse_plain_auth(Plain) ->
+    case binstr:split(Plain, <<0>>) of
+        [_Identity, Username, Password] -> {ok, Username, Password};
+        [Username, Password] -> {ok, Username, Password};
+        _ -> error
+    end.
+
+reject_auth(Message, State) ->
+    send(State, Message),
+    {ok, clear_sasl_state(State)}.
+
+clear_sasl_state(#state{envelope = #envelope{} = Envelope} = State) ->
+    State#state{
+        waitingauth = false,
+        authdata = undefined,
+        envelope = Envelope#envelope{auth = {<<>>, <<>>}}
+    };
+clear_sasl_state(State) ->
+    State#state{waitingauth = false, authdata = undefined}.
+
+%% RFC 1870: the SIZE parameter value is a sequence of digits. Signed text
+%% such as "+1" or "-0" is a syntax error, not a number.
+parse_size(<<>>) ->
+    error;
+parse_size(Size) ->
+    case re:run(Size, "^[0-9]+$") of
+        {match, _} -> {ok, binary_to_integer(Size)};
+        nomatch -> error
+    end.
+
 %% @doc handle SASL client response to `334' challenge - RFC-4954
 % the client sends a response to auth-cram-md5
 handle_sasl(
@@ -938,21 +1100,15 @@ handle_sasl(
         [Username, Digest] ->
             try_auth('cram-md5', Username, {Digest, AuthData}, State#state{authdata = undefined});
         _ ->
-            % TODO error
-            {ok, State#state{waitingauth = false, authdata = undefined}}
+            reject_auth("501 Authentication line too long / invalid\r\n", State)
     end;
 % the client sends a \0username\0password response to auth-plain
-handle_sasl(
-    UserPass, #state{waitingauth = 'plain', envelope = #envelope{auth = {<<>>, <<>>}}} = State
-) ->
-    case binstr:split(UserPass, <<0>>) of
-        [_Identity, Username, Password] ->
+handle_sasl(UserPass, #state{waitingauth = 'plain'} = State) ->
+    case parse_plain_auth(UserPass) of
+        {ok, Username, Password} ->
             try_auth('plain', Username, Password, State);
-        [Username, Password] ->
-            try_auth('plain', Username, Password, State);
-        _ ->
-            % TODO error
-            {ok, State#state{waitingauth = false}}
+        error ->
+            reject_auth("501 Authentication line too long / invalid\r\n", State)
     end;
 % the client sends a username response to auth-login
 handle_sasl(
@@ -1141,13 +1297,43 @@ try_auth(
 %binary_to_list(base64:encode(lists:flatten(A ++ B))).
 
 %% @doc a tight loop to receive the message body
-receive_data(_Acc, _Transport, _Socket, _, Size, MaxSize, Session, _Options) when
+receive_data(_Acc, _Transport, _Socket, _, Size, MaxSize, Session, _Options, _Deadline) when
     MaxSize =/= 'infinity', Size > MaxSize
 ->
     ?LOG_INFO("SMTP message body size ~B exceeded maximum allowed ~B", [Size, MaxSize], ?LOGGER_META),
     Session ! {receive_data, {error, size_exceeded}};
-receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options) ->
-    case Transport:recv(Socket, RecvSize, 1000) of
+receive_data(
+    Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, infinity
+) ->
+    %% `infinity' data_timeout disables the wall-clock budget; wait in bounded
+    %% slices so socket errors still surface promptly.
+    receive_data_before_deadline(
+        Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, infinity, 1000
+    );
+receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline) ->
+    Remaining = Deadline - erlang:monotonic_time(millisecond),
+    case Remaining =< 0 of
+        true ->
+            Session ! {receive_data, {error, data_timeout}};
+        false ->
+            receive_data_before_deadline(
+                Acc,
+                Transport,
+                Socket,
+                RecvSize,
+                Size,
+                MaxSize,
+                Session,
+                Options,
+                Deadline,
+                min(1000, Remaining)
+            )
+    end.
+
+receive_data_before_deadline(
+    Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, RecvTimeout
+) ->
+    case Transport:recv(Socket, RecvSize, RecvTimeout) of
         {ok, Packet} when Acc =:= [] ->
             case
                 check_bare_crlf(
@@ -1175,7 +1361,8 @@ receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options) 
                                 Size + byte_size(FixedPacket),
                                 MaxSize,
                                 Session,
-                                Options
+                                Options,
+                                Deadline
                             );
                         Index ->
                             String = binstr:substr(FixedPacket, 1, Index - 1),
@@ -1226,7 +1413,8 @@ receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options) 
                                 Size + byte_size(FixedPacket),
                                 MaxSize,
                                 Session,
-                                Options
+                                Options,
+                                Deadline
                             );
                         Index ->
                             String = binstr:substr(FixedPacket, 1, Index - 1),
@@ -1264,7 +1452,9 @@ receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options) 
                         ?LOGGER_META
                     ),
                     % eventually we'll either get data or a different error, just keep retrying
-                    receive_data(Acc, Transport, Socket, 0, Size, MaxSize, Session, Options);
+                    receive_data(
+                        Acc, Transport, Socket, 0, Size, MaxSize, Session, Options, Deadline
+                    );
                 Index ->
                     String = binstr:substr(Packet, 1, Index - 1),
                     Rest = binstr:substr(Packet, Index + 5),
@@ -1286,7 +1476,7 @@ receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options) 
                     Session ! {receive_data, Result, Rest}
             end;
         {error, timeout} ->
-            receive_data(Acc, Transport, Socket, 0, Size, MaxSize, Session, Options);
+            receive_data(Acc, Transport, Socket, 0, Size, MaxSize, Session, Options, Deadline);
         {error, Reason} ->
             ?LOG_WARNING("SMTP receive error: ~p", [Reason], ?LOGGER_META),
             Session ! {receive_data, {error, Reason}}
@@ -1382,6 +1572,45 @@ setopts(#state{transport = Transport, socket = Sock} = St, Opts) ->
 
 hostname(Opts) ->
     proplists:get_value(hostname, Opts, smtp_util:guess_FQDN()).
+
+%% OTP timers accept millisecond integers up to 4294967295, or the atom
+%% `infinity' for no timeout. Zero is valid and expires immediately.
+valid_timeout(infinity) -> true;
+valid_timeout(Value) when is_integer(Value), Value >= 0, Value =< 4294967295 -> true;
+valid_timeout(_) -> false.
+
+%% The reply is normalized to a UTF-8 binary. Strings, binaries and anything
+%% that is not a valid UTF-8 binary (invalid UTF-8, atoms, lists with
+%% non-printable integers) are rejected.
+normalize_reply(Reply) when is_binary(Reply) ->
+    case unicode:characters_to_binary(Reply) of
+        Reply -> Reply;
+        _ -> error
+    end;
+normalize_reply(Reply) when is_list(Reply) ->
+    try unicode:characters_to_binary(Reply) of
+        Binary when is_binary(Binary) -> Binary;
+        _ -> error
+    catch
+        _:_ -> error
+    end;
+normalize_reply(_) ->
+    error.
+
+has_forbidden_reply_char(Reply) ->
+    lists:any(fun is_forbidden_reply_char/1, unicode:characters_to_list(Reply)).
+
+is_forbidden_reply_char($\r) -> true;
+is_forbidden_reply_char($\n) -> true;
+is_forbidden_reply_char(0) -> true;
+is_forbidden_reply_char(_) -> false.
+
+is_smtp_reply_code(<<C1, C2, C3, $\s, _/binary>>) when
+    C1 >= $0, C1 =< $9, C2 >= $0, C2 =< $9, C3 >= $0, C3 =< $9
+->
+    true;
+is_smtp_reply_code(_) ->
+    false.
 
 %% @hidden
 lhlo_if_lmtp(Protocol, Fallback) ->
