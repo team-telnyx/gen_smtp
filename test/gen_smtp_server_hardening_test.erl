@@ -339,7 +339,9 @@ invalid_auth_required_reply_option_test_() ->
         {"empty binary", <<>>},
         {"missing reply code", <<"Encryption required">>},
         {"non-digit reply code", <<"53x Encryption required">>},
-        {"invalid UTF-8", <<"538 ", 16#FF>>}
+        {"invalid UTF-8", <<"538 ", 16#FF>>},
+        {"improper list", ["538 " | bad_tail]},
+        {"proper list with tuple", [<<"538 ">>, {bad}]}
     ],
     [
         {lists:flatten(io_lib:format("auth_required_reply rejects ~s at init", [Label])), fun() ->

@@ -1588,9 +1588,11 @@ normalize_reply(Reply) when is_binary(Reply) ->
         _ -> error
     end;
 normalize_reply(Reply) when is_list(Reply) ->
-    case unicode:characters_to_binary(Reply) of
+    try unicode:characters_to_binary(Reply) of
         Binary when is_binary(Binary) -> Binary;
         _ -> error
+    catch
+        _:_ -> error
     end;
 normalize_reply(_) ->
     error.
