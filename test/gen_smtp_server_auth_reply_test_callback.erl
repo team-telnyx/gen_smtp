@@ -58,9 +58,22 @@ handle_other(_Verb, _Args, State) ->
 %% Valid credential -> success with a custom 235 reply.
 handle_AUTH(_Type, <<"apikey">>, <<"valid-key">>, State) ->
     {reply, <<"235 2.7.0 Authenticated">>, State};
-%% Invalid credential -> failure with a custom 421 reply.
+%% Invalid credential -> failure with a custom 535 reply (5yz keeps the
+%% session open so the client may retry; 4yz is terminal and tested
+%% separately below).
 handle_AUTH(_Type, <<"apikey">>, <<"invalid-key">>, State) ->
+    {error, <<"535 5.7.8 Authentication credentials invalid">>, State};
+%% Terminal temporary failure: a 4yz custom reply must close the session
+%% exactly like the timeout-421 does (P6 A-M1).
+handle_AUTH(_Type, <<"apikey">>, <<"down-key">>, State) ->
     {error, <<"421 4.7.0 Temporary authentication failure, retry later">>, State};
+%% Unicode charlist success reply: must be validated, normalized to UTF-8
+%% and sent as that binary — never the original list (P6 A-H1).
+handle_AUTH(_Type, <<"apikey">>, <<"unicode-key">>, State) ->
+    {reply, "235 2.7.0 Authenticated \x{03bb}", State};
+%% Shape/status-class contradictions must fall back to stock 535 (P6 A-M2).
+handle_AUTH(_Type, <<"apikey">>, <<"contradiction-key">>, State) ->
+    {error, <<"235 2.7.0 should not be an error shape">>, State};
 %% Any other shape keeps the stock behavior: plain failure.
 handle_AUTH(_Type, _Username, _Password, _State) ->
     error.

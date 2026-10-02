@@ -200,16 +200,62 @@ p5_auth_reply_callback_module_test() ->
                 ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "valid-key">>), "\r\n"],
                 <<"235 2.7.0 Authenticated\r\n">>
             ),
+            %% 5yz custom failure: sent verbatim, session stays usable (NOOP 250).
             assert_rejection_and_noop(
                 Socket,
                 ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "invalid-key">>), "\r\n"],
-                <<"421 4.7.0 Temporary authentication failure, retry later\r\n">>
+                <<"535 5.7.8 Authentication credentials invalid\r\n">>
             ),
-            %% A malformed custom reply (no valid SMTP code) must not be sent
-            %% verbatim: the session falls back to the stock 535 failure
-            %% rather than emitting protocol garbage. Tested via the third
-            %% clause below? No - third clause returns plain `error'; see
-            %% p5_auth_reply_invalid_reply_falls_back_to_stock_test/0.
+            %% Shape/status-class contradiction: falls back to stock 535 bytes.
+            assert_rejection_and_noop(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "contradiction-key">>), "\r\n"],
+                <<"535 Authentication failed.\r\n">>
+            ),
+            noop(Socket)
+        end
+    ).
+
+%% P6 (A-M1): a 4yz custom reply is TERMINAL — the connection closes right
+%% after the reply, exactly like the command/data timeout-421. The pre-P6
+%% behavior (socket still answering NOOP 250) was the divergence Astra
+%% found; this test pins the corrected closure semantics.
+p6_auth_reply_421_closes_connection_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            ok = gen_tcp:send(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "down-key">>), "\r\n"]
+            ),
+            ?assertEqual(
+                <<"421 4.7.0 Temporary authentication failure, retry later\r\n">>,
+                recv(Socket)
+            ),
+            %% The server MUST close: EOF after the 421 (recv on a closed
+            %% socket answers {error, closed}).
+            ?assertEqual({error, closed}, recv(Socket))
+        end
+    ).
+
+%% P6 (A-H1): a Unicode charlist custom reply is validated, normalized to a
+%% UTF-8 binary and sent as that binary. The pre-P6 code validated the
+%% normalized form but sent the original list, crashing the session and
+%% leaking the AUTH payload in the crash report.
+p6_auth_reply_unicode_list_on_wire_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            ok = gen_tcp:send(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "unicode-key">>), "\r\n"]
+            ),
+            ?assertEqual(<<"235 2.7.0 Authenticated \xce\xbb\r\n">>, recv(Socket)),
+            %% Session survives; still usable.
             noop(Socket)
         end
     ).
