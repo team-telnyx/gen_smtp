@@ -240,6 +240,71 @@ p6_auth_reply_421_closes_connection_test() ->
         end
     ).
 
+%% P7 (A-M1): the SASL CONTINUATION path — "AUTH PLAIN" (no payload) → 334 →
+%% credential line — must treat a terminal 4yz reply exactly like the fused
+%% path does: reply, close, NO MatchError crash. Pre-P7 the continuation
+%% dispatcher hard-matched {ok, NewState} and a stop tuple crashed the
+%% GenServer, with the crash report carrying the credential line as
+%% "Last message". This probe is Astra's exact reproducer.
+p7_continuation_terminal_421_no_crash_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            %% Multi-leg AUTH PLAIN: bare AUTH PLAIN, wait for 334.
+            ok = gen_tcp:send(Socket, "AUTH PLAIN\r\n"),
+            ?assertEqual(<<"334\r\n">>, recv(Socket)),
+            %% Now the credential line — the server answers the custom 421
+            %% and MUST close cleanly ({error, closed}, not a crash).
+            ok = gen_tcp:send(
+                Socket,
+                [base64:encode(<<0, "apikey", 0, "down-key">>), "\r\n"]
+            ),
+            ?assertEqual(
+                <<"421 4.7.0 Temporary authentication failure, retry later\r\n">>,
+                recv(Socket)
+            ),
+            ?assertEqual({error, closed}, recv(Socket))
+        end
+    ).
+
+%% P7 (A-L1): the complete-line bound. A 510-byte payload is the last size
+%% that fits 512 WITH CRLF; 511 and 512-byte payloads must be rejected as
+%% Line too long. Pre-P7 the bound was payload-only at 512, so a 512-byte
+%% payload reached the wire as a 514-byte line.
+p7_reply_line_bound_complete_line_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_bound_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            %% 510: last legal complete line.
+            ok = gen_tcp:send(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "bound510">>), "\r\n"]
+            ),
+            ?assertEqual(<<(pad510())/binary>>, recv(Socket)),
+            noop(Socket),
+            %% 511: must be rejected, session stays open.
+            assert_rejection_and_noop(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "bound511">>), "\r\n"],
+                <<"500 Line too long\r\n">>
+            )
+        end
+    ).
+
+
+%% P7 (A-L1) helper: the exact 510-byte reply the bound callback builds
+%% ("535 5.7.8 bound 510 ok" + 488 trailing spaces + CRLF).
+pad510() ->
+    Prefix = <<"535 5.7.8 bound 510 ok">>,
+    <<Prefix/binary, (pad(510 - byte_size(Prefix)))/binary, "\r\n">>.
+
+pad(N) ->
+    binary:copy(<<" ">>, N).
+
 %% P6 (A-H1): a Unicode charlist custom reply is validated, normalized to a
 %% UTF-8 binary and sent as that binary. The pre-P6 code validated the
 %% normalized form but sent the original list, crashing the session and

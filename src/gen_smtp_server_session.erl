@@ -236,7 +236,9 @@ validate_session_options(Options) ->
 auth_required_reply(Options) ->
     RawReply = proplists:get_value(auth_required_reply, Options, "502 Error: AUTH not implemented"),
     case normalize_reply(RawReply) of
-        Reply when is_binary(Reply), byte_size(Reply) =< 512 ->
+        %% P7 (A-L1): the bound covers the COMPLETE CRLF-terminated line —
+        %% payload at most 510 bytes so payload + "\r\n" fits 512.
+        Reply when is_binary(Reply), byte_size(Reply) =< 510 ->
             case {is_smtp_reply_code(Reply), has_forbidden_reply_char(Reply)} of
                 {true, false} -> Reply;
                 _ -> error
@@ -432,7 +434,7 @@ handle_info({SocketType, Socket, Packet}, #state{socket = Socket} = State) when
         $\s
     ),
     ?LOG_DEBUG("Got SASL request", ?LOGGER_META),
-    {ok, NewState} =
+    case
         case Request of
             <<"*">> ->
                 reject_auth("501 Authentication aborted\r\n", State);
@@ -443,9 +445,19 @@ handle_info({SocketType, Socket, Packet}, #state{socket = Socket} = State) when
                     error ->
                         reject_auth("501 Authentication line too long / invalid\r\n", State)
                 end
-        end,
-    setopts(NewState, [{active, once}]),
-    {noreply, NewState, command_timeout(NewState)};
+        end
+    of
+        {ok, NewState} ->
+            setopts(NewState, [{active, once}]),
+            {noreply, NewState, command_timeout(NewState)};
+        %% P7 (A-M1): a terminal reply (4yz custom failure) legitimately
+        %% returns a stop tuple from try_auth — the SASL continuation
+        %% dispatcher must accept it exactly like the command dispatcher
+        %% does. The previous hard match {ok, NewState} crashed with
+        %% MatchError and the crash report leaked the AUTH line.
+        {stop, Reason, NewState} ->
+            {stop, Reason, NewState}
+    end;
 handle_info({Kind, _Socket}, State) when
     Kind == tcp_closed;
     Kind == ssl_closed
@@ -1291,7 +1303,7 @@ try_auth(
                 %% and the bound covers the complete CRLF-terminated line.
                 {reply, Reply, CallbackState} ->
                     case validated_auth_reply(success, Reply) of
-                        {ok, ReplyBin} when byte_size(ReplyBin) =< 512 ->
+                        {ok, ReplyBin} when byte_size(ReplyBin) =< 510 ->
                             send(State, [ReplyBin, "\r\n"]),
                             {ok, NewState#state{
                                 callbackstate = CallbackState,
@@ -1306,7 +1318,7 @@ try_auth(
                     end;
                 {error, Reply, CallbackState} when is_binary(Reply); is_list(Reply) ->
                     case validated_auth_reply(failure, Reply) of
-                        {ok, ReplyBin} when byte_size(ReplyBin) =< 512 ->
+                        {ok, ReplyBin} when byte_size(ReplyBin) =< 510 ->
                             send(State, [ReplyBin, "\r\n"]),
                             terminal_auth_reply(ReplyBin, NewState#state{callbackstate = CallbackState});
                         {ok, _TooLong} ->
