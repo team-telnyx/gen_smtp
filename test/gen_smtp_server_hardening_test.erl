@@ -184,6 +184,193 @@ data_timeout_5_seconds_test_() ->
         end)
     end}.
 
+%% P5 (MSG-2345): custom AUTH reply shapes. Submission-tier auth is backed by a
+%% remote auth service; temporary failures must answer a 421 with an enhanced
+%% code and successes must be able to carry an enhanced code too, while stock
+%% callers keep the byte-for-byte stock replies.
+
+p5_auth_reply_callback_module_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            command(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "valid-key">>), "\r\n"],
+                <<"235 2.7.0 Authenticated\r\n">>
+            ),
+            %% 5yz custom failure: sent verbatim, session stays usable (NOOP 250).
+            assert_rejection_and_noop(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "invalid-key">>), "\r\n"],
+                <<"535 5.7.8 Authentication credentials invalid\r\n">>
+            ),
+            %% Shape/status-class contradiction: falls back to stock 535 bytes.
+            assert_rejection_and_noop(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "contradiction-key">>), "\r\n"],
+                <<"535 Authentication failed.\r\n">>
+            ),
+            noop(Socket)
+        end
+    ).
+
+%% P6 (A-M1): a 4yz custom reply is TERMINAL — the connection closes right
+%% after the reply, exactly like the command/data timeout-421. The pre-P6
+%% behavior (socket still answering NOOP 250) was the divergence Astra
+%% found; this test pins the corrected closure semantics.
+p6_auth_reply_421_closes_connection_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            ok = gen_tcp:send(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "down-key">>), "\r\n"]
+            ),
+            ?assertEqual(
+                <<"421 4.7.0 Temporary authentication failure, retry later\r\n">>,
+                recv(Socket)
+            ),
+            %% The server MUST close: EOF after the 421 (recv on a closed
+            %% socket answers {error, closed}).
+            ?assertEqual({error, closed}, recv(Socket))
+        end
+    ).
+
+%% P7 (A-M1): the SASL CONTINUATION path — "AUTH PLAIN" (no payload) → 334 →
+%% credential line — must treat a terminal 4yz reply exactly like the fused
+%% path does: reply, close, NO MatchError crash. Pre-P7 the continuation
+%% dispatcher hard-matched {ok, NewState} and a stop tuple crashed the
+%% GenServer, with the crash report carrying the credential line as
+%% "Last message". This probe is Astra's exact reproducer.
+p7_continuation_terminal_421_no_crash_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            %% Multi-leg AUTH PLAIN: bare AUTH PLAIN, wait for 334.
+            ok = gen_tcp:send(Socket, "AUTH PLAIN\r\n"),
+            ?assertEqual(<<"334\r\n">>, recv(Socket)),
+            %% Now the credential line — the server answers the custom 421
+            %% and MUST close cleanly ({error, closed}, not a crash).
+            ok = gen_tcp:send(
+                Socket,
+                [base64:encode(<<0, "apikey", 0, "down-key">>), "\r\n"]
+            ),
+            ?assertEqual(
+                <<"421 4.7.0 Temporary authentication failure, retry later\r\n">>,
+                recv(Socket)
+            ),
+            ?assertEqual({error, closed}, recv(Socket))
+        end
+    ).
+
+%% P7 (A-L1): the complete-line bound. A 510-byte payload is the last size
+%% that fits 512 WITH CRLF; 511 and 512-byte payloads must be rejected as
+%% Line too long. Pre-P7 the bound was payload-only at 512, so a 512-byte
+%% payload reached the wire as a 514-byte line.
+p7_reply_line_bound_complete_line_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_bound_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            %% 510: last legal complete line.
+            ok = gen_tcp:send(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "bound510">>), "\r\n"]
+            ),
+            ?assertEqual(<<(pad510())/binary>>, recv(Socket)),
+            noop(Socket),
+            %% 511: must be rejected, session stays open.
+            assert_rejection_and_noop(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "bound511">>), "\r\n"],
+                <<"500 Line too long\r\n">>
+            )
+        end
+    ).
+
+
+%% P7 (A-L1) helper: the exact 510-byte reply the bound callback builds
+%% ("535 5.7.8 bound 510 ok" + 488 trailing spaces + CRLF).
+pad510() ->
+    Prefix = <<"535 5.7.8 bound 510 ok">>,
+    <<Prefix/binary, (pad(510 - byte_size(Prefix)))/binary, "\r\n">>.
+
+pad(N) ->
+    binary:copy(<<" ">>, N).
+
+%% P6 (A-H1): a Unicode charlist custom reply is validated, normalized to a
+%% UTF-8 binary and sent as that binary. The pre-P6 code validated the
+%% normalized form but sent the original list, crashing the session and
+%% leaking the AUTH payload in the crash report.
+p6_auth_reply_unicode_list_on_wire_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            ok = gen_tcp:send(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "unicode-key">>), "\r\n"]
+            ),
+            ?assertEqual(<<"235 2.7.0 Authenticated \xce\xbb\r\n">>, recv(Socket)),
+            %% Session survives; still usable.
+            noop(Socket)
+        end
+    ).
+
+%% P5: success shape `{reply, Reply, State}' must accept lists as well as
+%% binaries (the stock 235 path sends iodata).
+p5_auth_reply_accepts_list_reply_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            %% LOGIN form exercises the 3-step path and the same try_auth.
+            %% (login_auth/2 in the helpers shows the sequence: AUTH LOGIN →
+            %% 334 Username prompt → username → 334 Password prompt →
+            %% password → final reply.)
+            begin_login_auth(Socket),
+            command(
+                Socket,
+                [base64:encode(<<"apikey">>), "\r\n"],
+                <<"334 UGFzc3dvcmQ6\r\n">>
+            ),
+            command(
+                Socket,
+                [base64:encode(<<"valid-key">>), "\r\n"],
+                <<"235 2.7.0 Authenticated\r\n">>
+            )
+        end
+    ).
+
+%% P5: an invalid custom reply (missing SMTP reply code) must never reach the
+%% wire; the session answers the stock 535 instead.
+p5_auth_reply_invalid_reply_falls_back_to_stock_test() ->
+    %% gen_smtp_server_auth_reply_test_callback's third clause returns plain
+    %% `error' (the stock failure), so drive the invalid-reply path through a
+    %% dedicated callback exported by the same test module: it returns an
+    %% {error, <<"no code">>, State} reply with no 3-digit prefix.
+    with_callback_server(
+        gen_smtp_server_auth_reply_invalid_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            assert_rejection_and_noop(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "bad">>), "\r\n"],
+                <<"535 Authentication failed.\r\n">>
+            )
+        end
+    ).
+
 %% P2: a caller can replace the stock reply when AUTH is not advertised.
 auth_required_reply_custom_test() ->
     with_server([], [{auth_required_reply, "538 Encryption required"}], fun(Socket) ->
@@ -457,6 +644,30 @@ with_auth_server(Fun) ->
 
 with_server(CallbackOptions, SessionOptions, Fun) ->
     with_server_context(CallbackOptions, SessionOptions, fun(Socket, _Name) -> Fun(Socket) end).
+
+%% P5 (MSG-2345): like with_server/3 but with a caller-supplied callback
+%% module, for exercising the custom AUTH reply shapes.
+with_callback_server(CallbackModule, CallbackOptions, Fun) ->
+    ok = ensure_gen_smtp_started(),
+    Name = {?MODULE, make_ref()},
+    {ok, _Pid} = gen_smtp_server:start(
+        Name,
+        CallbackModule,
+        [
+            {domain, "localhost"},
+            {port, 0},
+            {sessionoptions, [{callbackoptions, CallbackOptions}]}
+        ]
+    ),
+    Port = ranch:get_port(Name),
+    {ok, Socket} = gen_tcp:connect("localhost", Port, [binary, {packet, line}, {active, false}]),
+    try
+        ?assertMatch(<<"220 localhost", _/binary>>, recv(Socket)),
+        Fun(Socket)
+    after
+        gen_tcp:close(Socket),
+        gen_smtp_server:stop(Name)
+    end.
 
 with_server_context(CallbackOptions, SessionOptions, Fun) ->
     ok = ensure_gen_smtp_started(),

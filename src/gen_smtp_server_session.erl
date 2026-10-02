@@ -236,7 +236,9 @@ validate_session_options(Options) ->
 auth_required_reply(Options) ->
     RawReply = proplists:get_value(auth_required_reply, Options, "502 Error: AUTH not implemented"),
     case normalize_reply(RawReply) of
-        Reply when is_binary(Reply), byte_size(Reply) =< 512 ->
+        %% P7 (A-L1): the bound covers the COMPLETE CRLF-terminated line —
+        %% payload at most 510 bytes so payload + "\r\n" fits 512.
+        Reply when is_binary(Reply), byte_size(Reply) =< 510 ->
             case {is_smtp_reply_code(Reply), has_forbidden_reply_char(Reply)} of
                 {true, false} -> Reply;
                 _ -> error
@@ -431,8 +433,8 @@ handle_info({SocketType, Socket, Packet}, #state{socket = Socket} = State) when
         left,
         $\s
     ),
-    ?LOG_DEBUG("Got SASL request ~p", [Request], ?LOGGER_META),
-    {ok, NewState} =
+    ?LOG_DEBUG("Got SASL request", ?LOGGER_META),
+    case
         case Request of
             <<"*">> ->
                 reject_auth("501 Authentication aborted\r\n", State);
@@ -443,9 +445,19 @@ handle_info({SocketType, Socket, Packet}, #state{socket = Socket} = State) when
                     error ->
                         reject_auth("501 Authentication line too long / invalid\r\n", State)
                 end
-        end,
-    setopts(NewState, [{active, once}]),
-    {noreply, NewState, command_timeout(NewState)};
+        end
+    of
+        {ok, NewState} ->
+            setopts(NewState, [{active, once}]),
+            {noreply, NewState, command_timeout(NewState)};
+        %% P7 (A-M1): a terminal reply (4yz custom failure) legitimately
+        %% returns a stop tuple from try_auth — the SASL continuation
+        %% dispatcher must accept it exactly like the command dispatcher
+        %% does. The previous hard match {ok, NewState} crashed with
+        %% MatchError and the crash report leaked the AUTH line.
+        {stop, Reason, NewState} ->
+            {stop, Reason, NewState}
+    end;
 handle_info({Kind, _Socket}, State) when
     Kind == tcp_closed;
     Kind == ssl_closed
@@ -515,7 +527,7 @@ parse_request(Packet) ->
         Index ->
             Verb = binstr:substr(Request, 1, Index - 1),
             Parameters = binstr:strip(binstr:substr(Request, Index + 1), left, $\s),
-            ?LOG_DEBUG("got a ~s request with parameters ~s", [Verb, Parameters], ?LOGGER_META),
+            ?LOG_DEBUG("got a ~s request with parameters", [Verb], ?LOGGER_META),
             {binstr:to_upper(Verb), Parameters}
     end.
 
@@ -1278,6 +1290,44 @@ try_auth(
                         callbackstate = CallbackState,
                         envelope = Envelope#envelope{auth = {Username, Credential}}
                     }};
+                %% P5/P6 (MSG-2345): a callback may answer AUTH with its own reply
+                %% bytes — `{reply, Reply, State}' for success (e.g. an
+                %% enhanced-code 235) and `{error, Reply, State}' for failure
+                %% (e.g. a 421 temporary-failure or a 535 with an enhanced
+                %% code). The reply must be a bounded single-line SMTP reply
+                %% with a 3-digit code; anything else falls back to the stock
+                %% 535 so no malformed bytes reach the wire. P6: the VALIDATED,
+                %% NORMALIZED binary is what goes on the wire (never the original
+                %% list), a 4yz reply is TERMINAL (closes like the timeout-421),
+                %% the reply's status class must agree with the return shape,
+                %% and the bound covers the complete CRLF-terminated line.
+                {reply, Reply, CallbackState} ->
+                    case validated_auth_reply(success, Reply) of
+                        {ok, ReplyBin} when byte_size(ReplyBin) =< 510 ->
+                            send(State, [ReplyBin, "\r\n"]),
+                            {ok, NewState#state{
+                                callbackstate = CallbackState,
+                                envelope = Envelope#envelope{auth = {Username, Credential}}
+                            }};
+                        {ok, _TooLong} ->
+                            send(State, "500 Line too long\r\n"),
+                            {ok, NewState#state{callbackstate = OldCallbackState}};
+                        error ->
+                            send(State, "535 Authentication failed.\r\n"),
+                            {ok, NewState#state{callbackstate = OldCallbackState}}
+                    end;
+                {error, Reply, CallbackState} when is_binary(Reply); is_list(Reply) ->
+                    case validated_auth_reply(failure, Reply) of
+                        {ok, ReplyBin} when byte_size(ReplyBin) =< 510 ->
+                            send(State, [ReplyBin, "\r\n"]),
+                            terminal_auth_reply(ReplyBin, NewState#state{callbackstate = CallbackState});
+                        {ok, _TooLong} ->
+                            send(State, "500 Line too long\r\n"),
+                            {ok, NewState#state{callbackstate = CallbackState}};
+                        error ->
+                            send(State, "535 Authentication failed.\r\n"),
+                            {ok, NewState#state{callbackstate = CallbackState}}
+                    end;
                 _Other ->
                     send(State, "535 Authentication failed.\r\n"),
                     {ok, NewState}
@@ -1289,6 +1339,56 @@ try_auth(
             ),
             send(State, "535 authentication failed (#5.7.1)\r\n"),
             {ok, NewState}
+    end.
+
+%% P5/P6: a custom AUTH reply must be a bounded single-line SMTP reply
+%% beginning with a 3-digit code and containing no CR/LF/NUL (reuses the P2
+%% reply validation helpers). P6: returns the NORMALIZED VALIDATED BINARY (a
+%% charlist input is validated and sent in one representation — the original
+%% list never reaches the wire), enforces the reply's status class to agree
+%% with the callback's return shape (a `{reply, ...}' must carry 2yz, an
+%% `{error, ...}' must carry a 4yz/5yz code), and bounds the reply so the
+%% CRLF-terminated line stays within the 512-octet SMTP reply line limit.
+validated_auth_reply(Shape, Reply) ->
+    case normalize_reply(Reply) of
+        ReplyBin when is_binary(ReplyBin), byte_size(ReplyBin) =< 512 ->
+            case {is_smtp_reply_code(ReplyBin), has_forbidden_reply_char(ReplyBin)} of
+                {true, false} ->
+                    case {Shape, reply_status_class(ReplyBin)} of
+                        {success, success} -> {ok, ReplyBin};
+                        {failure, failure} -> {ok, ReplyBin};
+                        _ -> error
+                    end;
+                _ ->
+                    error
+            end;
+        _ ->
+            error
+    end.
+
+reply_status_class(<<C, _/binary>>) when C >= $2, C =< $3 -> success;
+reply_status_class(<<C, _/binary>>) when C >= $4, C =< $5 -> failure;
+reply_status_class(_) -> error.
+
+%% P6: a 4yz custom failure reply is TERMINAL — the server closes the
+%% connection exactly like the command/data timeout-421 does. 5yz replies
+%% keep the session open (the client may retry with fresh credentials).
+terminal_auth_reply(<<"4", _/binary>>, State) ->
+    {stop, normal, State};
+terminal_auth_reply(<<"5", _/binary>>, State) ->
+    {ok, State}.
+
+%% P6: the pre-P5 single-reply shape kept for compatibility with callbacks
+%% written against the original contract.
+valid_auth_reply(Reply) ->
+    case normalize_reply(Reply) of
+        Reply1 when is_binary(Reply1), byte_size(Reply1) =< 512 ->
+            case {is_smtp_reply_code(Reply1), has_forbidden_reply_char(Reply1)} of
+                {true, false} -> true;
+                _ -> false
+            end;
+        _ ->
+            false
     end.
 
 %get_digest_nonce() ->
