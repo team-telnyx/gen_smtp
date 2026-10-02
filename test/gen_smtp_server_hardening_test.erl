@@ -184,6 +184,82 @@ data_timeout_5_seconds_test_() ->
         end)
     end}.
 
+%% P5 (MSG-2345): custom AUTH reply shapes. Submission-tier auth is backed by a
+%% remote auth service; temporary failures must answer a 421 with an enhanced
+%% code and successes must be able to carry an enhanced code too, while stock
+%% callers keep the byte-for-byte stock replies.
+
+p5_auth_reply_callback_module_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            command(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "valid-key">>), "\r\n"],
+                <<"235 2.7.0 Authenticated\r\n">>
+            ),
+            assert_rejection_and_noop(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "invalid-key">>), "\r\n"],
+                <<"421 4.7.0 Temporary authentication failure, retry later\r\n">>
+            ),
+            %% A malformed custom reply (no valid SMTP code) must not be sent
+            %% verbatim: the session falls back to the stock 535 failure
+            %% rather than emitting protocol garbage. Tested via the third
+            %% clause below? No - third clause returns plain `error'; see
+            %% p5_auth_reply_invalid_reply_falls_back_to_stock_test/0.
+            noop(Socket)
+        end
+    ).
+
+%% P5: success shape `{reply, Reply, State}' must accept lists as well as
+%% binaries (the stock 235 path sends iodata).
+p5_auth_reply_accepts_list_reply_test() ->
+    with_callback_server(
+        gen_smtp_server_auth_reply_test_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            %% LOGIN form exercises the 3-step path and the same try_auth.
+            %% (login_auth/2 in the helpers shows the sequence: AUTH LOGIN →
+            %% 334 Username prompt → username → 334 Password prompt →
+            %% password → final reply.)
+            begin_login_auth(Socket),
+            command(
+                Socket,
+                [base64:encode(<<"apikey">>), "\r\n"],
+                <<"334 UGFzc3dvcmQ6\r\n">>
+            ),
+            command(
+                Socket,
+                [base64:encode(<<"valid-key">>), "\r\n"],
+                <<"235 2.7.0 Authenticated\r\n">>
+            )
+        end
+    ).
+
+%% P5: an invalid custom reply (missing SMTP reply code) must never reach the
+%% wire; the session answers the stock 535 instead.
+p5_auth_reply_invalid_reply_falls_back_to_stock_test() ->
+    %% gen_smtp_server_auth_reply_test_callback's third clause returns plain
+    %% `error' (the stock failure), so drive the invalid-reply path through a
+    %% dedicated callback exported by the same test module: it returns an
+    %% {error, <<"no code">>, State} reply with no 3-digit prefix.
+    with_callback_server(
+        gen_smtp_server_auth_reply_invalid_callback,
+        [{auth, true}],
+        fun(Socket) ->
+            ehlo(Socket),
+            assert_rejection_and_noop(
+                Socket,
+                ["AUTH PLAIN ", base64:encode(<<0, "apikey", 0, "bad">>), "\r\n"],
+                <<"535 Authentication failed.\r\n">>
+            )
+        end
+    ).
+
 %% P2: a caller can replace the stock reply when AUTH is not advertised.
 auth_required_reply_custom_test() ->
     with_server([], [{auth_required_reply, "538 Encryption required"}], fun(Socket) ->
@@ -457,6 +533,30 @@ with_auth_server(Fun) ->
 
 with_server(CallbackOptions, SessionOptions, Fun) ->
     with_server_context(CallbackOptions, SessionOptions, fun(Socket, _Name) -> Fun(Socket) end).
+
+%% P5 (MSG-2345): like with_server/3 but with a caller-supplied callback
+%% module, for exercising the custom AUTH reply shapes.
+with_callback_server(CallbackModule, CallbackOptions, Fun) ->
+    ok = ensure_gen_smtp_started(),
+    Name = {?MODULE, make_ref()},
+    {ok, _Pid} = gen_smtp_server:start(
+        Name,
+        CallbackModule,
+        [
+            {domain, "localhost"},
+            {port, 0},
+            {sessionoptions, [{callbackoptions, CallbackOptions}]}
+        ]
+    ),
+    Port = ranch:get_port(Name),
+    {ok, Socket} = gen_tcp:connect("localhost", Port, [binary, {packet, line}, {active, false}]),
+    try
+        ?assertMatch(<<"220 localhost", _/binary>>, recv(Socket)),
+        Fun(Socket)
+    after
+        gen_tcp:close(Socket),
+        gen_smtp_server:stop(Name)
+    end.
 
 with_server_context(CallbackOptions, SessionOptions, Fun) ->
     ok = ensure_gen_smtp_started(),

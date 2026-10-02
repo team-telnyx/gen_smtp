@@ -1278,6 +1278,34 @@ try_auth(
                         callbackstate = CallbackState,
                         envelope = Envelope#envelope{auth = {Username, Credential}}
                     }};
+                %% P5 (MSG-2345): a callback may answer AUTH with its own reply
+                %% bytes — `{reply, Reply, State}' for success (e.g. an
+                %% enhanced-code 235) and `{error, Reply, State}' for failure
+                %% (e.g. a 421 temporary-failure or a 535 with an enhanced
+                %% code). The reply must be a bounded single-line SMTP reply
+                %% with a 3-digit code; anything else falls back to the stock
+                %% 535 so no malformed bytes reach the wire.
+                {reply, Reply, CallbackState} ->
+                    case valid_auth_reply(Reply) of
+                        true ->
+                            send(State, [Reply, "\r\n"]),
+                            {ok, NewState#state{
+                                callbackstate = CallbackState,
+                                envelope = Envelope#envelope{auth = {Username, Credential}}
+                            }};
+                        false ->
+                            send(State, "535 Authentication failed.\r\n"),
+                            {ok, NewState#state{callbackstate = OldCallbackState}}
+                    end;
+                {error, Reply, CallbackState} when is_binary(Reply); is_list(Reply) ->
+                    case valid_auth_reply(Reply) of
+                        true ->
+                            send(State, [Reply, "\r\n"]),
+                            {ok, NewState#state{callbackstate = CallbackState}};
+                        false ->
+                            send(State, "535 Authentication failed.\r\n"),
+                            {ok, NewState#state{callbackstate = CallbackState}}
+                    end;
                 _Other ->
                     send(State, "535 Authentication failed.\r\n"),
                     {ok, NewState}
@@ -1289,6 +1317,20 @@ try_auth(
             ),
             send(State, "535 authentication failed (#5.7.1)\r\n"),
             {ok, NewState}
+    end.
+
+%% P5: a custom AUTH reply must be a bounded single-line SMTP reply beginning
+%% with a 3-digit code and containing no CR/LF/NUL (reuses the P2 reply
+%% validation helpers).
+valid_auth_reply(Reply) ->
+    case normalize_reply(Reply) of
+        Reply1 when is_binary(Reply1), byte_size(Reply1) =< 512 ->
+            case {is_smtp_reply_code(Reply1), has_forbidden_reply_char(Reply1)} of
+                {true, false} -> true;
+                _ -> false
+            end;
+        _ ->
+            false
     end.
 
 %get_digest_nonce() ->
