@@ -1550,8 +1550,8 @@ receive_data_before_deadline(
                 error ->
                     Session ! {receive_data, {error, bare_newline}};
                 FixedPacket ->
-                    case binstr:strpos(FixedPacket, <<"\r\n.\r\n">>) of
-                        0 ->
+                    case data_terminator(Acc, Size, FixedPacket, Admission) of
+                        nomatch ->
                             ?LOG_DEBUG(
                                 "received ~B bytes; size is now ~p",
                                 [
@@ -1560,7 +1560,7 @@ receive_data_before_deadline(
                                 ?LOGGER_META
                             ),
                             ?LOG_DEBUG("memory usage: ~p", [erlang:process_info(self(), memory)], ?LOGGER_META),
-                            receive_more(
+                            admit_more(
                                 [FixedPacket | Acc],
                                 Transport,
                                 Socket,
@@ -1572,12 +1572,8 @@ receive_data_before_deadline(
                                 Deadline,
                                 Admission
                             );
-                        Index ->
-                            String = binstr:substr(FixedPacket, 1, Index - 1),
-                            Rest = binstr:substr(FixedPacket, Index + 5),
-                            deliver_data(
-                                [String | Acc], Size + byte_size(String), Rest, MaxSize, Session, Deadline, Admission
-                            )
+                        {Parts, BodySize, Rest} ->
+                            deliver_data(Parts, BodySize, Rest, MaxSize, Session, Deadline, Admission)
                     end
             end;
         {ok, Packet} ->
@@ -1590,8 +1586,8 @@ receive_data_before_deadline(
                 error ->
                     Session ! {receive_data, {error, bare_newline}};
                 FixedPacket ->
-                    case binstr:strpos(FixedPacket, <<"\r\n.\r\n">>) of
-                        0 ->
+                    case data_terminator(Acc, Size, FixedPacket, Admission) of
+                        nomatch ->
                             ?LOG_DEBUG(
                                 "received ~B bytes; size is now ~p",
                                 [
@@ -1600,7 +1596,7 @@ receive_data_before_deadline(
                                 ?LOGGER_META
                             ),
                             ?LOG_DEBUG("memory usage: ~p", [erlang:process_info(self(), memory)], ?LOGGER_META),
-                            receive_more(
+                            admit_more(
                                 [FixedPacket | Acc],
                                 Transport,
                                 Socket,
@@ -1612,12 +1608,8 @@ receive_data_before_deadline(
                                 Deadline,
                                 Admission
                             );
-                        Index ->
-                            String = binstr:substr(FixedPacket, 1, Index - 1),
-                            Rest = binstr:substr(FixedPacket, Index + 5),
-                            deliver_data(
-                                [String | Acc], Size + byte_size(String), Rest, MaxSize, Session, Deadline, Admission
-                            )
+                        {Parts, BodySize, Rest} ->
+                            deliver_data(Parts, BodySize, Rest, MaxSize, Session, Deadline, Admission)
                     end
             end;
         {error, timeout} when RecvSize =:= 0, length(Acc) > 1 ->
@@ -1658,23 +1650,35 @@ receive_data_before_deadline(
             Session ! {receive_data, {error, Reason}}
     end.
 
-%% A packet without the terminator was accumulated. In admission mode
-%% (pending or admitted) a terminator that starts in the packets before it and
-%% ends in it is found at once — whatever the packet sizes — so the admission
-%% decision always sees the real end of the message. Then, the first time the
-%% accumulated size exceeds the threshold (and is still within the maximum,
-%% which the next receive_data/10 would refuse anyway) the receiver stops
-%% reading and asks the session.
-receive_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, none) ->
-    receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, none);
-receive_more([Packet | Older] = Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, Admission) ->
-    case boundary_terminator(Older, Packet) of
+%% The first end-of-data terminator in the packets received so far (`Acc',
+%% newest first, `Size' bytes, holding none) followed by `Packet': the body
+%% parts before it (newest first), their size and the bytes after it.
+%%
+%% In admission mode (pending or admitted) a terminator that starts in `Acc'
+%% and ends in `Packet' is found at once — whatever the packet sizes — so the
+%% admission decision always sees the real end of the message. Being the
+%% first, it wins over any later whole terminator in `Packet', which would
+%% otherwise take the bytes between the two (a pipelined command) as body.
+%% Without admission only `Packet' is searched, as before.
+data_terminator(Acc, Size, Packet, Admission) ->
+    case boundary_terminator(Acc, Packet, Admission) of
         {Parts, InOlder, Rest} ->
-            deliver_data(Parts, Size - byte_size(Packet) - InOlder, Rest, MaxSize, Session, Deadline, Admission);
+            {Parts, Size - InOlder, Rest};
         nomatch ->
-            admit_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, Admission)
+            case binstr:strpos(Packet, <<"\r\n.\r\n">>) of
+                0 ->
+                    nomatch;
+                Index ->
+                    String = binstr:substr(Packet, 1, Index - 1),
+                    Rest = binstr:substr(Packet, Index + 5),
+                    {[String | Acc], Size + byte_size(String), Rest}
+            end
     end.
 
+%% A packet without the terminator was accumulated. In admission mode, the
+%% first time the accumulated size exceeds the threshold (and is still within
+%% the maximum, which the next receive_data/10 would refuse anyway) the
+%% receiver stops reading and asks the session.
 admit_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, {pending, Threshold}) when
     Size > Threshold, MaxSize =:= infinity orelse Size =< MaxSize
 ->
@@ -1692,12 +1696,15 @@ admit_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, De
     receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, Admission).
 
 %% A terminator that starts in `Older' (the packets before `Packet', newest
-%% first) and ends in `Packet' (which holds no whole terminator itself).
-%% Returns the body parts with the terminator's leading bytes removed, how many
-%% bytes those were, and the bytes after the terminator.
-boundary_terminator([], _Packet) ->
+%% first) and ends in `Packet' — the first in `Older' ++ `Packet' when there is
+%% one, wherever else `Packet' holds a whole terminator. Returns the body parts
+%% with the terminator's leading bytes removed, how many bytes those were, and
+%% the bytes after the terminator. Looked for in admission mode only.
+boundary_terminator(_Older, _Packet, none) ->
     nomatch;
-boundary_terminator(Older, Packet) ->
+boundary_terminator([], _Packet, _Admission) ->
+    nomatch;
+boundary_terminator(Older, Packet, _Admission) ->
     Tail = history_tail(Older),
     Head = binary:part(Packet, 0, min(?DATA_TERMINATOR_TAIL, byte_size(Packet))),
     case binary:match(<<Tail/binary, Head/binary>>, <<"\r\n.\r\n">>) of
