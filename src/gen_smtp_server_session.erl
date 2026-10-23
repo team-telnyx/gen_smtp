@@ -95,7 +95,10 @@
     tls = false :: boolean(),
     callbackstate :: any(),
     protocol = smtp :: 'smtp' | 'lmtp',
-    options = [] :: [tuple()]
+    options = [] :: [tuple()],
+    %% handle_DATA_admission/2 answered `ok' for the DATA being received: it
+    %% ends in handle_DATA/4 or handle_DATA_aborted/2 (data_aborted/2).
+    data_admitted = false :: boolean()
 }).
 
 -type tls_opt() :: ssl:tls_server_option().
@@ -193,8 +196,20 @@
 %% Active only when the option is set AND the callback is exported.
 -callback handle_DATA_admission(ReceivedBytes :: non_neg_integer(), State :: state()) ->
     {ok, state()} | {refuse, Reply :: string() | binary(), state()}.
+%% A DATA admitted by handle_DATA_admission/2 (`{ok, State}') ended WITHOUT
+%% handle_DATA/4: whatever the admission took can be released here. Called in
+%% the session process, once per admitted DATA, after any handle_error/3 for
+%% the same event, with the reason the DATA ended: `size_exceeded' (over the
+%% maximum size, while receiving or in the final packet; 552), `bare_newline'
+%% (451), `data_timeout' (the DATA deadline, seen by the receiver or by the
+%% session; 421), `{receive_error, Reason}' (the socket failed or closed) or
+%% `{terminate, Reason}' (the session stopped). Optional: without it the
+%% session behaves exactly as before it existed.
+-callback handle_DATA_aborted(Reason :: term(), State :: state()) -> {ok, state()}.
 
--optional_callbacks([handle_info/2, handle_AUTH/4, handle_error/3, handle_DATA_admission/2]).
+-optional_callbacks([
+    handle_info/2, handle_AUTH/4, handle_error/3, handle_DATA_admission/2, handle_DATA_aborted/2
+]).
 
 %% @doc Start a SMTP session linked to the calling process.
 -spec start_link(
@@ -359,19 +374,19 @@ handle_cast(_Msg, State) ->
 handle_info({receive_data, {error, size_exceeded}}, #state{readmessage = true} = State) ->
     send(State, "552 Message too large\r\n"),
     setopts(State, [{active, once}]),
-    State1 = handle_error(data_rejected, size_exceeded, State),
+    State1 = data_aborted(size_exceeded, handle_error(data_rejected, size_exceeded, State)),
     {noreply, State1#state{readmessage = false, envelope = #envelope{}}, command_timeout(State1)};
 handle_info({receive_data, {error, bare_newline}}, #state{readmessage = true} = State) ->
     send(State, "451 Bare newline detected\r\n"),
     setopts(State, [{active, once}]),
-    State1 = handle_error(data_rejected, bare_neline, State),
+    State1 = data_aborted(bare_newline, handle_error(data_rejected, bare_neline, State)),
     {noreply, State1#state{readmessage = false, envelope = #envelope{}}, command_timeout(State1)};
 handle_info({receive_data, {error, data_timeout}}, #state{readmessage = true} = State) ->
     send(State, "421 Error: timeout exceeded\r\n"),
-    State1 = handle_error(timeout, data, State),
+    State1 = data_aborted(data_timeout, handle_error(timeout, data, State)),
     {stop, normal, State1};
 handle_info({receive_data, {error, Other}}, #state{readmessage = true} = State) ->
-    State1 = handle_error(data_receive_error, Other, State),
+    State1 = data_aborted({receive_error, Other}, handle_error(data_receive_error, Other, State)),
     {stop, {error_receiving_data, Other}, State1};
 %% Receive-time DATA admission: the receiver crossed the threshold and is
 %% waiting (not reading) for this answer. The callback runs HERE, in the
@@ -390,7 +405,8 @@ handle_info(
                 {{refuse, ?DEFAULT_ADMISSION_REFUSAL}, OldCallbackState}
         end,
     Receiver ! {data_admission, Ref, Answer},
-    {noreply, State#state{callbackstate = CallbackState}, admission_wait_timeout(Deadline)};
+    {noreply, State#state{callbackstate = CallbackState, data_admitted = Answer =:= ok},
+        admission_wait_timeout(Deadline)};
 %% A refused DATA was read to its terminator and dropped: answer the refusal
 %% instead of handle_DATA/4, then carry on exactly as after a delivered DATA.
 handle_info(
@@ -438,14 +454,17 @@ handle_info(
                 State#state{
                     readmessage = false,
                     envelope = #envelope{},
-                    callbackstate = CallbackState
+                    callbackstate = CallbackState,
+                    data_admitted = false
                 },
                 command_timeout(State)};
         false ->
             send(State, "552 Message too large\r\n"),
             setopts(State, [{active, once}]),
-            % might not even be able to get here anymore...
-            {noreply, State#state{readmessage = false, envelope = #envelope{}}, command_timeout(State)}
+            % reached when the packet carrying the terminator takes the
+            % message over the maximum size
+            State1 = data_aborted(size_exceeded, State),
+            {noreply, State1#state{readmessage = false, envelope = #envelope{}}, command_timeout(State1)}
     end;
 handle_info(
     {SocketType, Socket, Packet},
@@ -535,7 +554,9 @@ handle_info({Kind, _Socket, Reason}, State) when
 handle_info(timeout, #state{socket = Socket, transport = Transport} = State) ->
     send(State, "421 Error: timeout exceeded\r\n"),
     Transport:close(Socket),
-    State1 = handle_error(timeout, [], State),
+    %% Only a DATA in progress can be admitted, and while it is received the
+    %% session's timeout is that DATA's deadline.
+    State1 = data_aborted(data_timeout, handle_error(timeout, [], State)),
     {stop, normal, State1};
 handle_info(Info, #state{module = Module, callbackstate = OldCallbackState} = State) ->
     case erlang:function_exported(Module, handle_info, 2) of
@@ -555,14 +576,32 @@ handle_info(Info, #state{module = Module, callbackstate = OldCallbackState} = St
 
 %% @hidden
 -spec terminate(Reason :: any(), State :: #state{}) -> 'ok'.
-terminate(Reason, #state{
-    socket = Socket,
-    transport = Transport,
-    module = Module,
-    callbackstate = CallbackState
-}) ->
+terminate(Reason, State) ->
+    #state{
+        socket = Socket,
+        transport = Transport,
+        module = Module,
+        callbackstate = CallbackState
+    } = data_aborted({terminate, Reason}, State),
     ok = Transport:close(Socket),
     Module:terminate(Reason, CallbackState).
+
+%% An admitted DATA that ends without handle_DATA/4 is reported, once, to the
+%% optional handle_DATA_aborted/2. A no-op for any other DATA, and when the
+%% callback is not exported.
+data_aborted(Reason, #state{data_admitted = true, module = Module, callbackstate = CallbackState} = State) ->
+    State1 = State#state{data_admitted = false},
+    case erlang:function_exported(Module, handle_DATA_aborted, 2) of
+        true ->
+            case Module:handle_DATA_aborted(Reason, CallbackState) of
+                {ok, NewCallbackState} -> State1#state{callbackstate = NewCallbackState};
+                _Other -> State1
+            end;
+        false ->
+            State1
+    end;
+data_aborted(_Reason, State) ->
+    State.
 
 %% @hidden
 -spec code_change(OldVsn :: any(), State :: #state{}, Extra :: any()) -> {'ok', #state{}}.
@@ -1619,25 +1658,75 @@ receive_data_before_deadline(
             Session ! {receive_data, {error, Reason}}
     end.
 
-%% A packet without the terminator was accumulated. In admission mode the
-%% first time the accumulated size exceeds the threshold (and is still within
-%% the maximum, which the next receive_data/10 would refuse anyway) the
-%% receiver stops reading and asks the session.
-receive_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, {pending, Threshold}) when
+%% A packet without the terminator was accumulated. In admission mode
+%% (pending or admitted) a terminator that starts in the packets before it and
+%% ends in it is found at once — whatever the packet sizes — so the admission
+%% decision always sees the real end of the message. Then, the first time the
+%% accumulated size exceeds the threshold (and is still within the maximum,
+%% which the next receive_data/10 would refuse anyway) the receiver stops
+%% reading and asks the session.
+receive_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, none) ->
+    receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, none);
+receive_more([Packet | Older] = Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, Admission) ->
+    case boundary_terminator(Older, Packet) of
+        {Parts, InOlder, Rest} ->
+            deliver_data(Parts, Size - byte_size(Packet) - InOlder, Rest, MaxSize, Session, Deadline, Admission);
+        nomatch ->
+            admit_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, Admission)
+    end.
+
+admit_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, {pending, Threshold}) when
     Size > Threshold, MaxSize =:= infinity orelse Size =< MaxSize
 ->
     case ask_admission(Session, Size, Deadline) of
         ok ->
             receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, admitted);
         {refuse, Reply} ->
-            [Last | _] = Acc,
-            %% A tail call: nothing received so far stays referenced.
-            discard_next(data_tail(<<>>, Last), Transport, Socket, Size, MaxSize, Session, Options, Deadline, Reply);
+            %% A tail call: nothing received so far stays referenced — only
+            %% the last bytes of it, wherever the packet boundaries fell.
+            discard_next(history_tail(Acc), Transport, Socket, Size, MaxSize, Session, Options, Deadline, Reply);
         timeout ->
             Session ! {receive_data, {error, data_timeout}}
     end;
-receive_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, Admission) ->
+admit_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, Admission) ->
     receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, Admission).
+
+%% A terminator that starts in `Older' (the packets before `Packet', newest
+%% first) and ends in `Packet' (which holds no whole terminator itself).
+%% Returns the body parts with the terminator's leading bytes removed, how many
+%% bytes those were, and the bytes after the terminator.
+boundary_terminator([], _Packet) ->
+    nomatch;
+boundary_terminator(Older, Packet) ->
+    Tail = history_tail(Older),
+    Head = binary:part(Packet, 0, min(?DATA_TERMINATOR_TAIL, byte_size(Packet))),
+    case binary:match(<<Tail/binary, Head/binary>>, <<"\r\n.\r\n">>) of
+        {Pos, Len} when Pos < byte_size(Tail) ->
+            InOlder = byte_size(Tail) - Pos,
+            RestStart = Len - InOlder,
+            {trim_parts(Older, InOlder), InOlder, binary:part(Packet, RestStart, byte_size(Packet) - RestStart)};
+        _ ->
+            nomatch
+    end.
+
+%% The last ?DATA_TERMINATOR_TAIL bytes of the parts (newest first), however
+%% they are split, as a fresh binary.
+history_tail(Parts) ->
+    history_tail(Parts, <<>>).
+
+history_tail([Part | Older], Tail) when byte_size(Tail) < ?DATA_TERMINATOR_TAIL ->
+    Take = min(?DATA_TERMINATOR_TAIL - byte_size(Tail), byte_size(Part)),
+    history_tail(Older, <<(binary:part(Part, byte_size(Part) - Take, Take))/binary, Tail/binary>>);
+history_tail(_Parts, Tail) ->
+    Tail.
+
+%% The parts (newest first) without their last N bytes.
+trim_parts(Parts, 0) ->
+    Parts;
+trim_parts([Part | Older], N) when byte_size(Part) > N ->
+    [binary:part(Part, 0, byte_size(Part) - N) | Older];
+trim_parts([Part | Older], N) ->
+    trim_parts(Older, N - byte_size(Part)).
 
 %% The terminator was found; `Parts' is the body in reverse order and `Size'
 %% its length. A message whose final packet first crosses the admission

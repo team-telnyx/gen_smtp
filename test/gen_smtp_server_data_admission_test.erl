@@ -37,7 +37,32 @@ data_admission_test_() ->
         {"deadline while waiting for admission", {timeout, 60, fun deadline_while_waiting_for_admission/0}},
         {"session crash while receiver waits", {timeout, 60, fun session_crash_while_receiver_waits/0}},
         {"socket close during discard", {timeout, 60, fun socket_close_during_discard/0}},
-        {"quit after refusal", {timeout, 60, fun quit_after_refusal/0}}
+        {"quit after refusal", {timeout, 60, fun quit_after_refusal/0}},
+        %% An admitted DATA ends in exactly one of handle_DATA/4 or
+        %% handle_DATA_aborted/2 (the second finding of Astra r3).
+        {"admitted final packet over size aborts", {timeout, 60, fun admitted_final_packet_over_size_aborts/0}},
+        {"admitted final packet over size without abort callback identical",
+            {timeout, 60, fun admitted_final_packet_over_size_without_abort_callback_identical/0}},
+        {"admitted stream over size aborts", {timeout, 60, fun admitted_stream_over_size_aborts/0}},
+        {"admitted bare newline aborts", {timeout, 60, fun admitted_bare_newline_aborts/0}},
+        {"admitted data deadline aborts", {timeout, 60, fun admitted_data_deadline_aborts/0}},
+        {"admitted socket close aborts", {timeout, 60, fun admitted_socket_close_aborts/0}},
+        {"delivered refused or unadmitted DATA never aborts",
+            {timeout, 60, fun delivered_refused_or_unadmitted_data_never_aborts/0}},
+        %% The end-of-data terminator across the admission boundary (Astra r3
+        %% finding 4).
+        {"split terminator below threshold refuse callback",
+            {timeout, 60, fun() -> split_terminator_below_threshold({refuse, "451 4.3.0 later"}) end}},
+        {"split terminator below threshold ok callback",
+            {timeout, 60, fun() -> split_terminator_below_threshold(ok) end}},
+        {"three packet terminator completed by the crossing packet",
+            {timeout, 60, fun three_packet_terminator_completed_by_crossing_packet/0}},
+        {"three packet terminator after admission ok", {timeout, 60, fun three_packet_terminator_after_admission_ok/0}},
+        {"split across the refusal transition", {timeout, 60, fun split_across_the_refusal_transition/0}},
+        {"terminator before the admission answer ok pipelined",
+            {timeout, 60, fun terminator_before_the_admission_answer_ok_pipelined/0}},
+        {"terminator before the admission answer refuse pipelined",
+            {timeout, 60, fun terminator_before_the_admission_answer_refuse_pipelined/0}}
     ].
 
 %% -- option absent / callback absent: unchanged -------------------------------
@@ -321,17 +346,254 @@ quit_after_refusal() ->
         ?assertEqual([], receivers(Session))
     end).
 
+%% -- an admitted DATA ends in handle_DATA/4 or handle_DATA_aborted/2 ---------------
+%%
+%% After an `ok' admission the callback may hold a resource (email_submission:
+%% a large-message budget permit) that only handle_DATA/4 would release. Every
+%% other way the DATA can end tells the callback through the optional
+%% handle_DATA_aborted(Reason, State).
+
+%% The final packet takes an admitted body over SIZE while also carrying the
+%% terminator: the post-read check answers 552 — and the callback is told.
+admitted_final_packet_over_size_aborts() ->
+    MaxSize = 1024 * 1024,
+    with_admission_server(
+        #{admission => ok, maxsize => MaxSize},
+        [{data_admission_threshold, 64 * 1024}],
+        fun(Socket, Session) ->
+            ?assertEqual(
+                [<<"552 Message too large\r\n">>, <<"250 Ok\r\n">>], over_size_in_final_packet(Socket, MaxSize)
+            ),
+            ?assertMatch({admission, Session, _}, next_event(admission)),
+            ?assertEqual({handle_DATA_aborted, Session, size_exceeded}, next_event(handle_DATA_aborted)),
+            ?assertEqual(none, next_event(handle_DATA, 0)),
+            ?assertEqual(none, next_event(handle_DATA_aborted, 0)),
+            %% The session carries on: the next DATA is delivered.
+            ?assertMatch([_, _, _, <<"250 queued\r\n">>], data_transaction(Socket, body(4096))),
+            ?assertEqual(none, next_event(handle_DATA_aborted, 0))
+        end
+    ).
+
+%% Without handle_DATA_aborted/2 the same scenario is answered byte for byte as
+%% before the callback existed.
+admitted_final_packet_over_size_without_abort_callback_identical() ->
+    MaxSize = 1024 * 1024,
+    Run = fun(Module) ->
+        with_callback_server(
+            Module,
+            #{admission => ok, maxsize => MaxSize},
+            [{data_admission_threshold, 64 * 1024}],
+            fun(Socket, _Session) ->
+                Replies = over_size_in_final_packet(Socket, MaxSize),
+                Next = data_transaction(Socket, body(4096)),
+                Replies ++ Next
+            end
+        )
+    end,
+    Without = Run(gen_smtp_server_data_admission_test_noabort_callback),
+    ?assertEqual(none, next_event(handle_DATA_aborted, 0)),
+    With = Run(?CALLBACK),
+    ?assertMatch([<<"552 Message too large\r\n">>, <<"250 Ok\r\n">> | _], Without),
+    ?assertEqual(Without, With).
+
+admitted_stream_over_size_aborts() ->
+    with_admission_server(
+        #{admission => ok, maxsize => 1024 * 1024},
+        [{data_admission_threshold, 64 * 1024}],
+        fun(Socket, Session) ->
+            begin_data(Socket),
+            spawn_sender(Socket, body(4 * 1024 * 1024), 0),
+            ?assertEqual(<<"552 Message too large\r\n">>, recv(Socket, 5000)),
+            ?assertMatch({admission, Session, _}, next_event(admission)),
+            ?assertMatch({handle_error, Session, data_rejected, size_exceeded}, next_event(handle_error)),
+            ?assertEqual({handle_DATA_aborted, Session, size_exceeded}, next_event(handle_DATA_aborted)),
+            ?assertEqual(none, next_event(handle_DATA, 0))
+        end
+    ).
+
+admitted_bare_newline_aborts() ->
+    with_admission_server(#{admission => ok}, [{data_admission_threshold, 1024}], fun(Socket, Session) ->
+        begin_data(Socket),
+        ok = gen_tcp:send(Socket, body(64 * 1024)),
+        {admission, Session, _} = next_event(admission),
+        ok = gen_tcp:send(Socket, "bare\nnewline\r\n"),
+        ?assertEqual(<<"451 Bare newline detected\r\n">>, recv(Socket)),
+        ?assertEqual({handle_DATA_aborted, Session, bare_newline}, next_event(handle_DATA_aborted)),
+        ?assertEqual(none, next_event(handle_DATA, 0)),
+        ?assertEqual(<<"250 Ok\r\n">>, command(Socket, "NOOP\r\n"))
+    end).
+
+admitted_data_deadline_aborts() ->
+    with_admission_server(
+        #{admission => ok},
+        [{data_admission_threshold, 1024}, {data_timeout, 1000}],
+        fun(Socket, Session) ->
+            begin_data(Socket),
+            ok = gen_tcp:send(Socket, body(64 * 1024)),
+            {admission, Session, _} = next_event(admission),
+            ?assertEqual(<<"421 Error: timeout exceeded\r\n">>, recv(Socket, 3000)),
+            ?assertEqual({handle_DATA_aborted, Session, data_timeout}, next_event(handle_DATA_aborted)),
+            assert_gone(Session),
+            ?assertEqual(none, next_event(handle_DATA, 0))
+        end
+    ).
+
+admitted_socket_close_aborts() ->
+    with_admission_server(#{admission => ok}, [{data_admission_threshold, 1024}], fun(Socket, Session) ->
+        begin_data(Socket),
+        ok = gen_tcp:send(Socket, body(64 * 1024)),
+        {admission, Session, _} = next_event(admission),
+        ok = gen_tcp:close(Socket),
+        ?assertEqual({handle_DATA_aborted, Session, {receive_error, closed}}, next_event(handle_DATA_aborted)),
+        assert_gone(Session),
+        ?assertMatch({terminate, Session, _}, next_event(terminate))
+    end).
+
+%% Delivered (handle_DATA/4), refused (never admitted) and unadmitted DATAs
+%% never reach handle_DATA_aborted/2.
+delivered_refused_or_unadmitted_data_never_aborts() ->
+    with_admission_server(#{admission => ok}, [{data_admission_threshold, 1024}], fun(Socket) ->
+        ?assertMatch([_, _, _, <<"250 queued\r\n">>], data_transaction(Socket, body(64 * 1024))),
+        ?assertMatch({handle_DATA, _, _, _}, next_event(handle_DATA))
+    end),
+    with_admission_server(#{admission => {refuse, "451 4.3.0 later"}}, [{data_admission_threshold, 1024}], fun(Socket) ->
+        ?assertMatch([_, _, _, <<"451 4.3.0 later\r\n">>], data_transaction(Socket, body(64 * 1024)))
+    end),
+    %% Below the threshold and over SIZE in one packet: never asked, so
+    %% never admitted.
+    with_admission_server(
+        #{admission => ok, maxsize => 4096},
+        [{data_admission_threshold, 1024 * 1024}],
+        fun(Socket) ->
+            begin_data(Socket),
+            ok = gen_tcp:send(Socket, [body(8192), "\r\n.\r\n"]),
+            ?assertEqual(<<"552 Message too large\r\n">>, recv(Socket)),
+            ?assertEqual(none, next_event(admission, 0))
+        end
+    ),
+    ?assertEqual(none, next_event(handle_DATA_aborted, 0)).
+
+%% -- the end-of-data terminator across the admission boundary ----------------------
+%%
+%% Each `send_packets' element is written separately and given time to be read
+%% on its own, so the receiver sees exactly these packets.
+
+%% Astra's vector: the packet that crosses the threshold completes a terminator
+%% split across packets, and the body before it is under the threshold — it is
+%% delivered without asking (whatever admission would answer), and the
+%% pipelined NOOP is processed.
+split_terminator_below_threshold(Answer) ->
+    Body = binary:copy(<<"a">>, 1020),
+    with_admission_server(#{admission => Answer}, [{data_admission_threshold, 1024}, {data_timeout, 3000}], fun(
+        Socket, Session
+    ) ->
+        begin_data(Socket),
+        send_packets(Socket, [<<Body/binary, "\r\n.">>, <<"\r\nNOOP\r\n">>]),
+        ?assertEqual(<<"250 queued\r\n">>, recv(Socket)),
+        ?assertEqual(<<"250 Ok\r\n">>, recv(Socket)),
+        ?assertEqual({handle_DATA, Session, 1020, erlang:md5(Body)}, next_event(handle_DATA)),
+        ?assertEqual(none, next_event(admission, 0))
+    end).
+
+%% The same, the terminator split over three packets.
+three_packet_terminator_completed_by_crossing_packet() ->
+    Body = binary:copy(<<"a">>, 1020),
+    with_admission_server(
+        #{admission => {refuse, "451 4.3.0 later"}},
+        [{data_admission_threshold, 1024}, {data_timeout, 3000}],
+        fun(Socket, Session) ->
+            begin_data(Socket),
+            send_packets(Socket, [<<Body/binary, "\r\n">>, <<".">>, <<"\r\nNOOP\r\n">>]),
+            ?assertEqual(<<"250 queued\r\n">>, recv(Socket)),
+            ?assertEqual(<<"250 Ok\r\n">>, recv(Socket)),
+            ?assertEqual({handle_DATA, Session, 1020, erlang:md5(Body)}, next_event(handle_DATA)),
+            ?assertEqual(none, next_event(admission, 0))
+        end
+    ).
+
+%% Admitted (`ok'), then a terminator split over three packets: found, the
+%% body is delivered whole, the pipelined command survives.
+three_packet_terminator_after_admission_ok() ->
+    Body = body(4096),
+    with_admission_server(#{admission => ok}, [{data_admission_threshold, 1024}, {data_timeout, 3000}], fun(
+        Socket, Session
+    ) ->
+        begin_data(Socket),
+        %% body/1 ends with CRLF: the terminator's first two bytes.
+        send_packets(Socket, [Body, <<".">>, <<"\r\nNOOP\r\n">>]),
+        ?assertEqual(<<"250 queued\r\n">>, recv(Socket)),
+        ?assertEqual(<<"250 Ok\r\n">>, recv(Socket)),
+        Delivered = binary:part(Body, 0, byte_size(Body) - 2),
+        ?assertEqual(
+            {handle_DATA, Session, byte_size(Delivered), erlang:md5(Delivered)},
+            next_event(handle_DATA)
+        ),
+        ?assertMatch({admission, Session, _}, next_event(admission))
+    end).
+
+%% The crossing packet is shorter than the terminator: the refusal's discard
+%% loop must keep the delimiter history from the packets before it.
+split_across_the_refusal_transition() ->
+    with_admission_server(
+        #{admission => {refuse, "451 4.3.0 later"}},
+        [{data_admission_threshold, 1024}, {data_timeout, 3000}],
+        fun(Socket, Session) ->
+            begin_data(Socket),
+            %% 1023 bytes (not over the threshold), then "\n." crosses it.
+            First = <<(binary:copy(<<"a">>, 1022))/binary, "\r">>,
+            send_packets(Socket, [First, <<"\n.">>, <<"\r\nNOOP\r\n">>]),
+            ?assertEqual(<<"451 4.3.0 later\r\n">>, recv(Socket)),
+            ?assertEqual(<<"250 Ok\r\n">>, recv(Socket)),
+            ?assertMatch({admission, Session, 1025}, next_event(admission)),
+            ?assertEqual(none, next_event(handle_DATA, 0))
+        end
+    ).
+
+%% The terminator (and a pipelined command) arrives in the packet that crosses
+%% the threshold: asked before handle_DATA/4, then delivered or refused, and
+%% the pipelined command is processed either way.
+terminator_before_the_admission_answer_ok_pipelined() ->
+    Body = body(4096),
+    with_admission_server(#{admission => {block, 200, ok}}, [{data_admission_threshold, 1024}], fun(Socket, Session) ->
+        begin_data(Socket),
+        ok = gen_tcp:send(Socket, [Body, "\r\n.\r\nNOOP\r\n"]),
+        ?assertEqual(<<"250 queued\r\n">>, recv(Socket)),
+        ?assertEqual(<<"250 Ok\r\n">>, recv(Socket)),
+        ?assertMatch({admission, Session, _}, next_event(admission)),
+        ?assertEqual({handle_DATA, Session, byte_size(Body), erlang:md5(Body)}, next_event(handle_DATA))
+    end).
+
+terminator_before_the_admission_answer_refuse_pipelined() ->
+    with_admission_server(
+        #{admission => {block, 200, {refuse, "451 4.3.0 later"}}},
+        [{data_admission_threshold, 1024}],
+        fun(Socket, Session) ->
+            begin_data(Socket),
+            %% The crossing packet ends inside the terminator; the rest of it
+            %% and the pipelined command arrive while admission is pending.
+            ok = gen_tcp:send(Socket, [body(4096), "\r"]),
+            {admission, Session, _} = next_event(admission),
+            ok = gen_tcp:send(Socket, "\n.\r\nNOOP\r\n"),
+            ?assertEqual(<<"451 4.3.0 later\r\n">>, recv(Socket)),
+            ?assertEqual(<<"250 Ok\r\n">>, recv(Socket)),
+            ?assertEqual(none, next_event(handle_DATA, 0))
+        end
+    ).
+
 %% -- helpers ------------------------------------------------------------------------
 
 with_admission_server(CallbackOptions, SessionOptions, Fun) when is_function(Fun, 1) ->
     with_admission_server(CallbackOptions, SessionOptions, fun(Socket, _Session) -> Fun(Socket) end);
 with_admission_server(CallbackOptions, SessionOptions, Fun) ->
+    with_callback_server(?CALLBACK, CallbackOptions, SessionOptions, Fun).
+
+with_callback_server(Module, CallbackOptions, SessionOptions, Fun) ->
     flush_events(),
     ok = ensure_gen_smtp_started(),
     Name = {?MODULE, make_ref()},
     {ok, _Pid} = gen_smtp_server:start(
         Name,
-        ?CALLBACK,
+        Module,
         [
             {domain, "localhost"},
             {port, 0},
@@ -407,6 +669,32 @@ send_chunks(Socket, Body, PauseMs) ->
     ok = gen_tcp:send(Socket, Chunk),
     PauseMs > 0 andalso timer:sleep(PauseMs),
     send_chunks(Socket, Rest, PauseMs).
+
+%% Each packet on its own: written, then given time to be read alone.
+send_packets(Socket, Packets) ->
+    lists:foreach(
+        fun(Packet) ->
+            ok = gen_tcp:send(Socket, Packet),
+            timer:sleep(150)
+        end,
+        Packets
+    ).
+
+%% An admitted DATA (threshold well below MaxSize) whose last packet both
+%% takes it one byte over MaxSize and carries the terminator. Returns the
+%% DATA reply and the reply to a NOOP after it.
+over_size_in_final_packet(Socket, MaxSize) ->
+    begin_data(Socket),
+    Head = body(MaxSize - 2000),
+    send_chunks(Socket, Head, 0),
+    {admission, _, _} = Admission = next_event(admission),
+    self() ! Admission,
+    %% Everything so far has been read: the final packet is read alone.
+    timer:sleep(200),
+    Last = binary:copy(<<"z">>, MaxSize + 1 - byte_size(Head)),
+    ok = gen_tcp:send(Socket, [Last, "\r\n.\r\n"]),
+    DataReply = recv(Socket, 5000),
+    [DataReply, command(Socket, "NOOP\r\n")].
 
 spawn_sender(Socket, Body, PauseMs) ->
     spawn(fun() -> catch send_chunks(Socket, Body, PauseMs) end).
