@@ -229,7 +229,12 @@ Session options are:
   end-of-data terminator without keeping it (the receiver holds at most the packet in hand) and
   answers `Reply` (a single-line 4yz/5yz reply; anything else answers a stock 451) instead of
   calling `handle_DATA/4`. The data timeout, the maximum size and `allow_bare_newlines` apply
-  in both cases.
+  in both cases. An admitted message (`{ok, State}`) then ends in exactly one of `handle_DATA/4`
+  or the optional `handle_DATA_aborted(Reason, State) -> {ok, State}`, called when it ends any
+  other way: over the maximum size (also when the packet carrying the terminator crosses it),
+  a bare newline, the data timeout, a socket error or close, or the session stopping. Without
+  that callback the session behaves exactly as before it existed. A terminator split across
+  packets around the admission point is found whatever the packet sizes.
 
 You can connect and test this using the `gen_smtp_client` via something like:
 

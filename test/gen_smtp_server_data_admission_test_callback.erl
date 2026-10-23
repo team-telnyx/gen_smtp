@@ -14,6 +14,7 @@
     handle_RCPT_extension/2,
     handle_DATA/4,
     handle_DATA_admission/2,
+    handle_DATA_aborted/2,
     handle_RSET/1,
     handle_VRFY/2,
     handle_other/3,
@@ -57,6 +58,11 @@ handle_DATA(_From, To, Data, #{test := Test} = State) ->
 handle_DATA_admission(ReceivedBytes, #{test := Test} = State) ->
     Test ! {admission, self(), ReceivedBytes},
     answer(maps:get(admission, State), State).
+
+%% An admitted DATA that ended without handle_DATA/4.
+handle_DATA_aborted(Reason, #{test := Test} = State) ->
+    Test ! {handle_DATA_aborted, self(), Reason},
+    {ok, State}.
 
 answer(ok, State) ->
     {ok, State};
