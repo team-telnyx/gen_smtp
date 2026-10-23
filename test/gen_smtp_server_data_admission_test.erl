@@ -62,7 +62,19 @@ data_admission_test_() ->
         {"terminator before the admission answer ok pipelined",
             {timeout, 60, fun terminator_before_the_admission_answer_ok_pipelined/0}},
         {"terminator before the admission answer refuse pipelined",
-            {timeout, 60, fun terminator_before_the_admission_answer_refuse_pipelined/0}}
+            {timeout, 60, fun terminator_before_the_admission_answer_refuse_pipelined/0}},
+        %% A terminator split across packets wins over a later whole one in the
+        %% packet that completes it (Astra r4).
+        {"boundary terminator plus full terminator refuse not asked",
+            {timeout, 60, fun() -> boundary_terminator_plus_full_terminator({refuse, "451 4.3.0 later"}, 1024) end}},
+        {"boundary terminator plus full terminator ok not asked",
+            {timeout, 60, fun() -> boundary_terminator_plus_full_terminator(ok, 1024) end}},
+        {"boundary terminator plus full terminator refused",
+            {timeout, 60, fun() -> boundary_terminator_plus_full_terminator({refuse, "451 4.3.0 later"}, 1000) end}},
+        {"boundary terminator plus full terminator admitted",
+            {timeout, 60, fun() -> boundary_terminator_plus_full_terminator(ok, 1000) end}},
+        {"boundary terminator overlapping a full terminator",
+            {timeout, 60, fun boundary_terminator_overlapping_a_full_terminator/0}}
     ].
 
 %% -- option absent / callback absent: unchanged -------------------------------
@@ -579,6 +591,63 @@ terminator_before_the_admission_answer_refuse_pipelined() ->
             ?assertEqual(none, next_event(handle_DATA, 0))
         end
     ).
+
+%% Astra r4's vector: the packet that completes a terminator split across
+%% packets also holds a later whole one ("NOOP\r\n.\r\n"). The first ends the
+%% message: the body is the 1020 bytes before it, and everything after it, the
+%% pipelined NOOP first, is the remainder handed back to the session. Under a
+%% 1024-byte threshold the body is never asked about; under 1000 the 1023
+%% bytes before the crossing packet are, and the answer decides.
+boundary_terminator_plus_full_terminator(Answer, Threshold) ->
+    Body = binary:copy(<<"a">>, 1020),
+    Asked = Threshold < 1023,
+    Delivered = not Asked orelse Answer =:= ok,
+    with_admission_server(
+        #{admission => Answer},
+        [{data_admission_threshold, Threshold}, {data_timeout, 3000}],
+        fun(Socket, Session) ->
+            begin_data(Socket),
+            send_packets(Socket, [<<Body/binary, "\r\n.">>, <<"\r\nNOOP\r\n.\r\nQUIT\r\n">>]),
+            DataReply = recv(Socket),
+            case Asked of
+                true -> ?assertEqual({admission, Session, 1023}, next_event(admission));
+                false -> ?assertEqual(none, next_event(admission, 0))
+            end,
+            case Delivered of
+                true ->
+                    ?assertEqual(<<"250 queued\r\n">>, DataReply),
+                    ?assertEqual({handle_DATA, Session, 1020, erlang:md5(Body)}, next_event(handle_DATA));
+                false ->
+                    ?assertEqual(<<"451 4.3.0 later\r\n">>, DataReply),
+                    ?assertEqual(none, next_event(handle_DATA, 0))
+            end,
+            assert_remainder(Socket, Session, <<"NOOP\r\n.\r\nQUIT">>)
+        end
+    ).
+
+%% The later whole terminator starts inside the split one: the "." line ends
+%% the message, it is not body.
+boundary_terminator_overlapping_a_full_terminator() ->
+    Body = binary:copy(<<"a">>, 1020),
+    with_admission_server(#{admission => ok}, [{data_admission_threshold, 1024}, {data_timeout, 3000}], fun(
+        Socket, Session
+    ) ->
+        begin_data(Socket),
+        send_packets(Socket, [<<Body/binary, "\r\n.">>, <<"\r\n.\r\nNOOP\r\n">>]),
+        ?assertEqual(<<"250 queued\r\n">>, recv(Socket)),
+        ?assertEqual({handle_DATA, Session, 1020, erlang:md5(Body)}, next_event(handle_DATA)),
+        ?assertEqual(none, next_event(admission, 0)),
+        assert_remainder(Socket, Session, <<".\r\nNOOP">>)
+    end).
+
+%% The session handed the remainder after the terminator to the command
+%% parser. It parses a remainder as one command line (as upstream does), so a
+%% remainder of several lines reaches handle_other/3 whole and is answered
+%% once; the session then carries on taking commands.
+assert_remainder(Socket, Session, Line) ->
+    ?assertEqual(<<"500 Error: command not recognized\r\n">>, recv(Socket)),
+    ?assertEqual({handle_other, Session, Line, <<>>}, next_event(handle_other)),
+    ?assertEqual(<<"250 Ok\r\n">>, command(Socket, "NOOP\r\n")).
 
 %% -- helpers ------------------------------------------------------------------------
 

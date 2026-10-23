@@ -81,7 +81,8 @@ handle_RSET(#{test := Test} = State) ->
 handle_VRFY(_Address, State) ->
     {error, "252 VRFY disabled", State}.
 
-handle_other(_Verb, _Args, State) ->
+handle_other(Verb, Args, #{test := Test} = State) ->
+    Test ! {handle_other, self(), Verb, Args},
     {["500 Error: command not recognized"], State}.
 
 handle_error(Class, Details, #{test := Test} = State) ->
