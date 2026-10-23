@@ -44,6 +44,12 @@
 ]).
 % 3 minutes
 -define(DEFAULT_TIMEOUT, 180000).
+%% Sent when a handle_DATA_admission/2 refusal reply is not a valid single-line
+%% 4yz/5yz reply, or the callback returns an unknown shape: never a false 250.
+-define(DEFAULT_ADMISSION_REFUSAL, <<"451 Requested action aborted: local error in processing">>).
+%% The end-of-data terminator is 5 bytes; the discard loop keeps the last 4
+%% bytes it has seen so a terminator split across packets is still found.
+-define(DATA_TERMINATOR_TAIL, 4).
 
 %% External API
 -export([start_link/3, start_link/4]).
@@ -105,6 +111,8 @@
     %% `infinity' is explicitly accepted and disables the timeout.
     | {command_timeout, non_neg_integer() | 'infinity'}
     | {data_timeout, non_neg_integer() | 'infinity'}
+    %% Opt-in receive-time DATA admission (see handle_DATA_admission/2).
+    | {data_admission_threshold, non_neg_integer()}
     | {hostname, inet:hostname()}
     | {protocol, smtp | lmtp}
     | {tls_options, [tls_opt()]}
@@ -173,8 +181,20 @@
 -callback handle_error(error_class(), any(), state()) ->
     {ok, state()} | {stop, Reason :: any(), state()}.
 -callback terminate(Reason :: any(), state()) -> {ok, Reason :: any(), state()}.
+%% Opt-in receive-time DATA admission. Called in the SESSION process (so any
+%% resource it takes is owned by the long-lived session) once, when the bytes
+%% the DATA receiver has accumulated first exceed the
+%% `{data_admission_threshold, Bytes}' session option — or, for a message whose
+%% final packet crosses it, before the message is handed to handle_DATA/4. The
+%% receiver stops reading while it waits (TCP backpressure). `{ok, State}'
+%% continues normally; `{refuse, Reply, State}' makes the receiver read to the
+%% end-of-data terminator WITHOUT retaining the body, then the session answers
+%% `Reply' (a 4yz/5yz single-line reply) instead of calling handle_DATA/4.
+%% Active only when the option is set AND the callback is exported.
+-callback handle_DATA_admission(ReceivedBytes :: non_neg_integer(), State :: state()) ->
+    {ok, state()} | {refuse, Reply :: string() | binary(), state()}.
 
--optional_callbacks([handle_info/2, handle_AUTH/4, handle_error/3]).
+-optional_callbacks([handle_info/2, handle_AUTH/4, handle_error/3, handle_DATA_admission/2]).
 
 %% @doc Start a SMTP session linked to the calling process.
 -spec start_link(
@@ -223,10 +243,18 @@ validate_session_options(Options) ->
         {_, false} ->
             {error, data_timeout};
         _ ->
-            case auth_required_reply(Options) of
-                error -> {error, auth_required_reply};
-                _Reply -> ok
+            case {auth_required_reply(Options), valid_data_admission_threshold(Options)} of
+                {error, _} -> {error, auth_required_reply};
+                {_Reply, false} -> {error, data_admission_threshold};
+                {_Reply, true} -> ok
             end
+    end.
+
+%% Absent (the default) disables receive-time DATA admission.
+valid_data_admission_threshold(Options) ->
+    case proplists:get_value(data_admission_threshold, Options) of
+        undefined -> true;
+        Threshold -> is_integer(Threshold) andalso Threshold >= 0
     end.
 
 %% The reply sent when AUTH is not advertised, normalized once at session init
@@ -345,6 +373,38 @@ handle_info({receive_data, {error, data_timeout}}, #state{readmessage = true} = 
 handle_info({receive_data, {error, Other}}, #state{readmessage = true} = State) ->
     State1 = handle_error(data_receive_error, Other, State),
     {stop, {error_receiving_data, Other}, State1};
+%% Receive-time DATA admission: the receiver crossed the threshold and is
+%% waiting (not reading) for this answer. The callback runs HERE, in the
+%% session process, so whatever it takes is owned by the session.
+handle_info(
+    {data_admission, Receiver, Ref, ReceivedBytes, Deadline},
+    #state{readmessage = true, module = Module, callbackstate = OldCallbackState} = State
+) ->
+    {Answer, CallbackState} =
+        case Module:handle_DATA_admission(ReceivedBytes, OldCallbackState) of
+            {ok, NewCallbackState} ->
+                {ok, NewCallbackState};
+            {refuse, Reply, NewCallbackState} ->
+                {{refuse, admission_refusal_reply(Reply)}, NewCallbackState};
+            _Other ->
+                {{refuse, ?DEFAULT_ADMISSION_REFUSAL}, OldCallbackState}
+        end,
+    Receiver ! {data_admission, Ref, Answer},
+    {noreply, State#state{callbackstate = CallbackState}, admission_wait_timeout(Deadline)};
+%% A refused DATA was read to its terminator and dropped: answer the refusal
+%% instead of handle_DATA/4, then carry on exactly as after a delivered DATA.
+handle_info(
+    {data_admission_discarded, Reply, Rest},
+    #state{socket = Socket, transport = Transport, readmessage = true, envelope = Env} = State
+) ->
+    case Rest of
+        <<>> -> ok;
+        _ -> self() ! {Transport:name(), Socket, Rest}
+    end,
+    setopts(State, [{packet, line}]),
+    send_admission_refusal(Reply, Env, State),
+    setopts(State, [{active, once}]),
+    {noreply, State#state{readmessage = false, envelope = #envelope{}}, command_timeout(State)};
 handle_info(
     {receive_data, Body, Rest},
     #state{
@@ -400,6 +460,7 @@ handle_info(
             DataTimeout = data_timeout(NewState),
             DataDeadline = data_deadline(DataTimeout),
             setopts(NewState, [{packet, raw}]),
+            Admission = data_admission(NewState),
             %% TODO: change to receive asynchronously in the same process
             spawn_opt(
                 fun() ->
@@ -412,7 +473,8 @@ handle_info(
                         MaxSize,
                         Session,
                         Options,
-                        DataDeadline
+                        DataDeadline,
+                        Admission
                     )
                 end,
                 [link, {fullsweep_after, 0}]
@@ -1397,20 +1459,25 @@ valid_auth_reply(Reply) ->
 %binary_to_list(base64:encode(lists:flatten(A ++ B))).
 
 %% @doc a tight loop to receive the message body
-receive_data(_Acc, _Transport, _Socket, _, Size, MaxSize, Session, _Options, _Deadline) when
+%%
+%% `Admission' is `none' unless receive-time DATA admission is active for this
+%% session (data_admission/1): then it is `{pending, Threshold}' until the
+%% session has answered, and `admitted' after an `ok'. With `none' and
+%% `admitted' every clause behaves exactly as the loop without admission.
+receive_data(_Acc, _Transport, _Socket, _, Size, MaxSize, Session, _Options, _Deadline, _Admission) when
     MaxSize =/= 'infinity', Size > MaxSize
 ->
     ?LOG_INFO("SMTP message body size ~B exceeded maximum allowed ~B", [Size, MaxSize], ?LOGGER_META),
     Session ! {receive_data, {error, size_exceeded}};
 receive_data(
-    Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, infinity
+    Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, infinity, Admission
 ) ->
     %% `infinity' data_timeout disables the wall-clock budget; wait in bounded
     %% slices so socket errors still surface promptly.
     receive_data_before_deadline(
-        Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, infinity, 1000
+        Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, infinity, 1000, Admission
     );
-receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline) ->
+receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, Admission) ->
     Remaining = Deadline - erlang:monotonic_time(millisecond),
     case Remaining =< 0 of
         true ->
@@ -1426,12 +1493,13 @@ receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, 
                 Session,
                 Options,
                 Deadline,
-                min(1000, Remaining)
+                min(1000, Remaining),
+                Admission
             )
     end.
 
 receive_data_before_deadline(
-    Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, RecvTimeout
+    Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, RecvTimeout, Admission
 ) ->
     case Transport:recv(Socket, RecvSize, RecvTimeout) of
         {ok, Packet} when Acc =:= [] ->
@@ -1453,7 +1521,7 @@ receive_data_before_deadline(
                                 ?LOGGER_META
                             ),
                             ?LOG_DEBUG("memory usage: ~p", [erlang:process_info(self(), memory)], ?LOGGER_META),
-                            receive_data(
+                            receive_more(
                                 [FixedPacket | Acc],
                                 Transport,
                                 Socket,
@@ -1462,27 +1530,15 @@ receive_data_before_deadline(
                                 MaxSize,
                                 Session,
                                 Options,
-                                Deadline
+                                Deadline,
+                                Admission
                             );
                         Index ->
                             String = binstr:substr(FixedPacket, 1, Index - 1),
                             Rest = binstr:substr(FixedPacket, Index + 5),
-                            ?LOG_DEBUG(
-                                "memory usage before flattening: ~p",
-                                [
-                                    erlang:process_info(self(), memory)
-                                ],
-                                ?LOGGER_META
-                            ),
-                            Result = list_to_binary(lists:reverse([String | Acc])),
-                            ?LOG_DEBUG(
-                                "memory usage after flattening: ~p",
-                                [
-                                    erlang:process_info(self(), memory)
-                                ],
-                                ?LOGGER_META
-                            ),
-                            Session ! {receive_data, Result, Rest}
+                            deliver_data(
+                                [String | Acc], Size + byte_size(String), Rest, MaxSize, Session, Deadline, Admission
+                            )
                     end
             end;
         {ok, Packet} ->
@@ -1505,7 +1561,7 @@ receive_data_before_deadline(
                                 ?LOGGER_META
                             ),
                             ?LOG_DEBUG("memory usage: ~p", [erlang:process_info(self(), memory)], ?LOGGER_META),
-                            receive_data(
+                            receive_more(
                                 [FixedPacket | Acc],
                                 Transport,
                                 Socket,
@@ -1514,27 +1570,15 @@ receive_data_before_deadline(
                                 MaxSize,
                                 Session,
                                 Options,
-                                Deadline
+                                Deadline,
+                                Admission
                             );
                         Index ->
                             String = binstr:substr(FixedPacket, 1, Index - 1),
                             Rest = binstr:substr(FixedPacket, Index + 5),
-                            ?LOG_DEBUG(
-                                "memory usage before flattening: ~p",
-                                [
-                                    erlang:process_info(self(), memory)
-                                ],
-                                ?LOGGER_META
-                            ),
-                            Result = list_to_binary(lists:reverse([String | Acc])),
-                            ?LOG_DEBUG(
-                                "memory usage after flattening: ~p",
-                                [
-                                    erlang:process_info(self(), memory)
-                                ],
-                                ?LOGGER_META
-                            ),
-                            Session ! {receive_data, Result, Rest}
+                            deliver_data(
+                                [String | Acc], Size + byte_size(String), Rest, MaxSize, Session, Deadline, Admission
+                            )
                     end
             end;
         {error, timeout} when RecvSize =:= 0, length(Acc) > 1 ->
@@ -1553,34 +1597,211 @@ receive_data_before_deadline(
                     ),
                     % eventually we'll either get data or a different error, just keep retrying
                     receive_data(
-                        Acc, Transport, Socket, 0, Size, MaxSize, Session, Options, Deadline
+                        Acc, Transport, Socket, 0, Size, MaxSize, Session, Options, Deadline, Admission
                     );
                 Index ->
                     String = binstr:substr(Packet, 1, Index - 1),
                     Rest = binstr:substr(Packet, Index + 5),
-                    ?LOG_DEBUG(
-                        "memory usage before flattening: ~p",
-                        [
-                            erlang:process_info(self(), memory)
-                        ],
-                        ?LOGGER_META
-                    ),
-                    Result = list_to_binary(lists:reverse([String | Acc2])),
-                    ?LOG_DEBUG(
-                        "memory usage after flattening: ~p",
-                        [
-                            erlang:process_info(self(), memory)
-                        ],
-                        ?LOGGER_META
-                    ),
-                    Session ! {receive_data, Result, Rest}
+                    deliver_data(
+                        [String | Acc2],
+                        Size - byte_size(Packet) + byte_size(String),
+                        Rest,
+                        MaxSize,
+                        Session,
+                        Deadline,
+                        Admission
+                    )
             end;
         {error, timeout} ->
-            receive_data(Acc, Transport, Socket, 0, Size, MaxSize, Session, Options, Deadline);
+            receive_data(Acc, Transport, Socket, 0, Size, MaxSize, Session, Options, Deadline, Admission);
         {error, Reason} ->
             ?LOG_WARNING("SMTP receive error: ~p", [Reason], ?LOGGER_META),
             Session ! {receive_data, {error, Reason}}
     end.
+
+%% A packet without the terminator was accumulated. In admission mode the
+%% first time the accumulated size exceeds the threshold (and is still within
+%% the maximum, which the next receive_data/10 would refuse anyway) the
+%% receiver stops reading and asks the session.
+receive_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, {pending, Threshold}) when
+    Size > Threshold, MaxSize =:= infinity orelse Size =< MaxSize
+->
+    case ask_admission(Session, Size, Deadline) of
+        ok ->
+            receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, admitted);
+        {refuse, Reply} ->
+            [Last | _] = Acc,
+            %% A tail call: nothing received so far stays referenced.
+            discard_next(data_tail(<<>>, Last), Transport, Socket, Size, MaxSize, Session, Options, Deadline, Reply);
+        timeout ->
+            Session ! {receive_data, {error, data_timeout}}
+    end;
+receive_more(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, Admission) ->
+    receive_data(Acc, Transport, Socket, RecvSize, Size, MaxSize, Session, Options, Deadline, Admission).
+
+%% The terminator was found; `Parts' is the body in reverse order and `Size'
+%% its length. A message whose final packet first crosses the admission
+%% threshold is asked about before it is flattened.
+deliver_data(Parts, Size, Rest, MaxSize, Session, Deadline, {pending, Threshold}) when
+    Size > Threshold, MaxSize =:= infinity orelse Size =< MaxSize
+->
+    case ask_admission(Session, Size, Deadline) of
+        ok -> deliver_data(Parts, Size, Rest, MaxSize, Session, Deadline, admitted);
+        {refuse, Reply} -> Session ! {data_admission_discarded, Reply, Rest};
+        timeout -> Session ! {receive_data, {error, data_timeout}}
+    end;
+deliver_data(Parts, _Size, Rest, _MaxSize, Session, _Deadline, _Admission) ->
+    ?LOG_DEBUG(
+        "memory usage before flattening: ~p",
+        [
+            erlang:process_info(self(), memory)
+        ],
+        ?LOGGER_META
+    ),
+    Result = list_to_binary(lists:reverse(Parts)),
+    ?LOG_DEBUG(
+        "memory usage after flattening: ~p",
+        [
+            erlang:process_info(self(), memory)
+        ],
+        ?LOGGER_META
+    ),
+    Session ! {receive_data, Result, Rest}.
+
+%% Asks the session (handle_info {data_admission, ...}) and waits — not
+%% reading the socket — for its answer until the DATA deadline.
+ask_admission(Session, Size, Deadline) ->
+    Ref = make_ref(),
+    Session ! {data_admission, self(), Ref, Size, Deadline},
+    receive
+        {data_admission, Ref, Answer} -> Answer
+    after admission_wait_timeout(Deadline) -> timeout
+    end.
+
+admission_wait_timeout(infinity) ->
+    infinity;
+admission_wait_timeout(Deadline) ->
+    max(0, Deadline - erlang:monotonic_time(millisecond)).
+
+%% A refused DATA: read to the end-of-data terminator keeping only the last
+%% ?DATA_TERMINATOR_TAIL bytes (enough to find a terminator split across
+%% packets, and the previous byte the bare-newline check needs), so the
+%% receiver holds at most the packet in hand. The deadline, the maximum size
+%% and the bare-newline policy apply exactly as while receiving.
+%%
+%% discard_next/9 is always entered by a tail call, so the packet just
+%% dropped (or the body accumulated before the refusal) is no longer
+%% referenced when it collects.
+discard_next(Tail, Transport, Socket, Size, MaxSize, Session, Options, Deadline, Reply) ->
+    erlang:garbage_collect(),
+    discard_data(Tail, Transport, Socket, Size, MaxSize, Session, Options, Deadline, Reply).
+
+discard_data(_Tail, _Transport, _Socket, Size, MaxSize, Session, _Options, _Deadline, _Reply) when
+    MaxSize =/= 'infinity', Size > MaxSize
+->
+    ?LOG_INFO("SMTP message body size ~B exceeded maximum allowed ~B", [Size, MaxSize], ?LOGGER_META),
+    Session ! {receive_data, {error, size_exceeded}};
+discard_data(Tail, Transport, Socket, Size, MaxSize, Session, Options, Deadline, Reply) ->
+    case discard_recv_timeout(Deadline) of
+        expired ->
+            Session ! {receive_data, {error, data_timeout}};
+        RecvTimeout ->
+            case Transport:recv(Socket, 0, RecvTimeout) of
+                {ok, Packet} ->
+                    BareNewlines = proplists:get_value(allow_bare_newlines, Options, false),
+                    case check_bare_crlf(Packet, Tail, BareNewlines, 0) of
+                        error ->
+                            Session ! {receive_data, {error, bare_newline}};
+                        FixedPacket ->
+                            case find_data_terminator(Tail, FixedPacket) of
+                                nomatch ->
+                                    discard_next(
+                                        data_tail(Tail, FixedPacket),
+                                        Transport,
+                                        Socket,
+                                        Size + byte_size(FixedPacket),
+                                        MaxSize,
+                                        Session,
+                                        Options,
+                                        Deadline,
+                                        Reply
+                                    );
+                                {rest, RestStart} ->
+                                    RestSize = byte_size(FixedPacket) - RestStart,
+                                    Rest = binary:copy(binary:part(FixedPacket, RestStart, RestSize)),
+                                    Session ! {data_admission_discarded, Reply, Rest}
+                            end
+                    end;
+                {error, timeout} ->
+                    discard_data(Tail, Transport, Socket, Size, MaxSize, Session, Options, Deadline, Reply);
+                {error, Reason} ->
+                    ?LOG_WARNING("SMTP receive error: ~p", [Reason], ?LOGGER_META),
+                    Session ! {receive_data, {error, Reason}}
+            end
+    end.
+
+%% The first end-of-data terminator in Tail ++ Packet, as the offset in
+%% Packet where the bytes after it start. Packet is never copied: a
+%% terminator that starts in Tail is looked for in Tail plus Packet's first
+%% bytes only.
+find_data_terminator(Tail, Packet) ->
+    Head = binary:part(Packet, 0, min(?DATA_TERMINATOR_TAIL, byte_size(Packet))),
+    Boundary = <<Tail/binary, Head/binary>>,
+    case binary:match(Boundary, <<"\r\n.\r\n">>) of
+        {Pos, Len} when Pos < byte_size(Tail) ->
+            {rest, Pos + Len - byte_size(Tail)};
+        _ ->
+            case binary:match(Packet, <<"\r\n.\r\n">>) of
+                {Pos, Len} -> {rest, Pos + Len};
+                nomatch -> nomatch
+            end
+    end.
+
+discard_recv_timeout(infinity) ->
+    1000;
+discard_recv_timeout(Deadline) ->
+    Remaining = Deadline - erlang:monotonic_time(millisecond),
+    case Remaining =< 0 of
+        true -> expired;
+        false -> min(1000, Remaining)
+    end.
+
+%% The last ?DATA_TERMINATOR_TAIL bytes of Tail ++ Packet, as a fresh binary
+%% (never a reference into the packet).
+data_tail(_Tail, Packet) when byte_size(Packet) >= ?DATA_TERMINATOR_TAIL ->
+    binary:copy(binary:part(Packet, byte_size(Packet) - ?DATA_TERMINATOR_TAIL, ?DATA_TERMINATOR_TAIL));
+data_tail(Tail, Packet) ->
+    Joined = <<Tail/binary, Packet/binary>>,
+    Keep = min(?DATA_TERMINATOR_TAIL, byte_size(Joined)),
+    binary:copy(binary:part(Joined, byte_size(Joined) - Keep, Keep)).
+
+%% Receive-time admission is active only when the session option is set AND
+%% the callback module exports handle_DATA_admission/2.
+data_admission(#state{options = Options, module = Module}) ->
+    case proplists:get_value(data_admission_threshold, Options) of
+        Threshold when is_integer(Threshold), Threshold >= 0 ->
+            case erlang:function_exported(Module, handle_DATA_admission, 2) of
+                true -> {pending, Threshold};
+                false -> none
+            end;
+        _ ->
+            none
+    end.
+
+%% The refusal reply goes on the wire as the validated, normalized binary; a
+%% reply that is not a single-line 4yz/5yz SMTP reply of at most 510 bytes
+%% falls back to ?DEFAULT_ADMISSION_REFUSAL.
+admission_refusal_reply(Reply) ->
+    case validated_auth_reply(failure, Reply) of
+        {ok, ReplyBin} when byte_size(ReplyBin) =< 510 -> ReplyBin;
+        _ -> ?DEFAULT_ADMISSION_REFUSAL
+    end.
+
+%% LMTP answers DATA once per recipient; SMTP once.
+send_admission_refusal(Reply, #envelope{to = To}, #state{protocol = lmtp} = State) ->
+    lists:foreach(fun(_Rcpt) -> send(State, [Reply, "\r\n"]) end, To);
+send_admission_refusal(Reply, _Envelope, State) ->
+    send(State, [Reply, "\r\n"]).
 
 check_for_bare_crlf(Bin, Offset) ->
     case

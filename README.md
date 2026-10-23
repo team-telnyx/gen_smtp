@@ -220,6 +220,16 @@ Session options are:
   send incoming email to local mail-handling applications that usually don't have a delivery queue.
   The default value of this option is `smtp`.
 * `{callbackoptions, any()}` - value will be passed as 4th argument to callback module's `init/4`
+* `{data_admission_threshold, non_neg_integer()}` - opt-in receive-time DATA admission. Active
+  only when this option is set AND the callback module exports the optional
+  `handle_DATA_admission(ReceivedBytes, State)`; otherwise DATA is received exactly as without it.
+  The first time the bytes received for a message exceed the threshold, the receiver stops
+  reading (TCP backpressure) and the session process calls `handle_DATA_admission/2`.
+  `{ok, State}` continues; `{refuse, Reply, State}` reads the rest of the message up to the
+  end-of-data terminator without keeping it (the receiver holds at most the packet in hand) and
+  answers `Reply` (a single-line 4yz/5yz reply; anything else answers a stock 451) instead of
+  calling `handle_DATA/4`. The data timeout, the maximum size and `allow_bare_newlines` apply
+  in both cases.
 
 You can connect and test this using the `gen_smtp_client` via something like:
 
