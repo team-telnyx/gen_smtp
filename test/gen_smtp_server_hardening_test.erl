@@ -216,6 +216,60 @@ p5_auth_reply_callback_module_test() ->
         end
     ).
 
+%% MSG-3078: a client that sends STARTTLS and then vanishes (sends no TLS
+%% handshake) must not crash the session with {stop, {send_error, closed}}:
+%% the server tries to reply (220 already went out; the post-handshake-failure
+%% 454 hits the dead socket) and the send_error throw used to escape
+%% handle_info and terminate the GenServer abnormally. The session MUST end
+%% gracefully with reason `normal' — terminate/2 classifies the disconnect —
+%% instead of crashing with send_error.
+starttls_peer_vanishes_during_handshake_test_() ->
+    {timeout, 10, fun starttls_peer_vanishes/0}.
+
+starttls_peer_vanishes() ->
+    with_starttls_server(fun(Socket, Name) ->
+        ehlo(Socket),
+        %% STARTTLS must be advertised: the example callback advertises it
+        %% when its `auth' option is on, and with_server/3 turns that on.
+        ok = gen_tcp:send(Socket, "STARTTLS\r\n"),
+        ?assertEqual(<<"220 OK\r\n">>, recv(Socket)),
+        Session = session_pid(Name),
+        ?assert(is_pid(Session)),
+        Ref = erlang:monitor(process, Session),
+        %% No TLS handshake: the client just goes away. The server's
+        %% ranch_ssl:handshake/3 (5 s timeout) fails, its 454 reply then hits
+        %% the dead socket, and the send_error throw used to crash the
+        %% session. Wait for the session to end and assert the exit reason is
+        %% `normal' — NOT {send_error, ...}.
+        gen_tcp:close(Socket),
+        Down =
+            receive
+                {'DOWN', Ref, process, Session, Reason} -> {down, Reason}
+            after 7000 ->
+                erlang:demonitor(Ref, [flush]),
+                {timeout, still_alive}
+            end,
+        ?assertMatch({down, normal}, Down)
+    end).
+
+%% MSG-3078: a STARTTLS-capable server with the listener name passed through,
+%% so the test can monitor the session process.
+with_starttls_server(Fun) ->
+    with_server_context([{auth, true}], starttls_session_options(), Fun).
+
+starttls_session_options() ->
+    [
+        {tls_options, [
+            {keyfile, "test/fixtures/mx1.example.com-server.key"},
+            {certfile, "test/fixtures/mx1.example.com-server.crt"}
+        ]}
+    ].
+
+%% Return the single live SMTP session pid for the running listener.
+session_pid(Name) ->
+    [Session | _] = gen_smtp_server:sessions(Name),
+    Session.
+
 %% P6 (A-M1): a 4yz custom reply is TERMINAL — the connection closes right
 %% after the reply, exactly like the command/data timeout-421. The pre-P6
 %% behavior (socket still answering NOOP 250) was the divergence Astra
@@ -294,7 +348,6 @@ p7_reply_line_bound_complete_line_test() ->
             )
         end
     ).
-
 
 %% P7 (A-L1) helper: the exact 510-byte reply the bound callback builds
 %% ("535 5.7.8 bound 510 ok" + 488 trailing spaces + CRLF).

@@ -1085,59 +1085,26 @@ handle_request(
     end;
 handle_request(
     {<<"STARTTLS">>, <<>>},
-    #state{
-        socket = Socket,
-        module = Module,
-        tls = false,
-        extensions = Extensions,
-        callbackstate = OldCallbackState,
-        options = Options
-    } = State
+    #state{tls = false, extensions = Extensions} = State
 ) ->
     case has_extension(Extensions, "STARTTLS") of
         {true, _} ->
-            send(State, "220 OK\r\n"),
-            TlsOpts0 = proplists:get_value(tls_options, Options, []),
-            TlsOpts1 =
-                case proplists:get_value(certfile, Options) of
-                    undefined ->
-                        TlsOpts0;
-                    CertFile ->
-                        [{certfile, CertFile} | TlsOpts0]
-                end,
-            TlsOpts2 =
-                case proplists:get_value(keyfile, Options) of
-                    undefined ->
-                        TlsOpts1;
-                    KeyFile ->
-                        [{keyfile, KeyFile} | TlsOpts1]
-                end,
-            %% Assert that socket is in passive state
-            {ok, [{active, false}]} = inet:getopts(Socket, [active]),
-            %XXX: see smtp_socket:?SSL_LISTEN_OPTIONS
-            case
-                ranch_ssl:handshake(
-                    Socket, [{packet, line}, {mode, list}, {ssl_imp, new} | TlsOpts2], 5000
-                )
-            of
-                {ok, NewSocket} ->
-                    ?LOG_DEBUG("SSL negotiation successful", ?LOGGER_META),
-                    ranch_ssl:setopts(NewSocket, [{packet, line}, binary]),
-                    {ok, State#state{
-                        socket = NewSocket,
-                        transport = ranch_ssl,
-                        envelope = undefined,
-                        authdata = undefined,
-                        waitingauth = false,
-                        readmessage = false,
-                        tls = true,
-                        callbackstate = Module:handle_STARTTLS(OldCallbackState)
-                    }};
-                {error, Reason} ->
-                    ?LOG_INFO("SSL handshake failed : ~p", [Reason], ?LOGGER_META),
-                    send(State, "454 TLS negotiation failed\r\n"),
-                    State1 = handle_error(ssl_handshake_error, Reason, State),
-                    {ok, State1}
+            %XXX: MSG-3078 — a client that vanishes right after STARTTLS (no
+            %XXX: TLS handshake) leaves a dead socket; a failed reply here
+            %XXX: means the peer is gone, so end the session gracefully
+            %XXX: ({stop, normal}) instead of crashing with
+            %XXX: {stop, {send_error, closed}}. The 454 send after a failed
+            %XXX: handshake is guarded the same way in starttls_handshake/1;
+            %XXX: send_error elsewhere keeps its crash classification.
+            try send(State, "220 OK\r\n") of
+                ok ->
+                    starttls_handshake(State)
+            catch
+                {stop, {send_error, Err}, St1} when
+                    Err == closed; Err == tcp_closed
+                ->
+                    ?LOG_INFO("Peer closed during STARTTLS negotiation", ?LOGGER_META),
+                    {stop, normal, St1}
             end;
         false ->
             send(State, "500 Command unrecognized\r\n"),
@@ -1160,6 +1127,66 @@ handle_request({Verb, Args}, #state{module = Module, callbackstate = OldCallback
                 CState1
         end,
     {ok, State#state{callbackstate = CallbackState}}.
+
+starttls_handshake(
+    #state{
+        socket = Socket, module = Module, callbackstate = OldCallbackState, options = Options
+    } = State
+) ->
+    TlsOpts0 = proplists:get_value(tls_options, Options, []),
+    TlsOpts1 =
+        case proplists:get_value(certfile, Options) of
+            undefined ->
+                TlsOpts0;
+            CertFile ->
+                [{certfile, CertFile} | TlsOpts0]
+        end,
+    TlsOpts2 =
+        case proplists:get_value(keyfile, Options) of
+            undefined ->
+                TlsOpts1;
+            KeyFile ->
+                [{keyfile, KeyFile} | TlsOpts1]
+        end,
+    %% Assert that socket is in passive state
+    {ok, [{active, false}]} = inet:getopts(Socket, [active]),
+    %XXX: see smtp_socket:?SSL_LISTEN_OPTIONS
+    case
+        ranch_ssl:handshake(
+            Socket, [{packet, line}, {mode, list}, {ssl_imp, new} | TlsOpts2], 5000
+        )
+    of
+        {ok, NewSocket} ->
+            ?LOG_DEBUG("SSL negotiation successful", ?LOGGER_META),
+            ranch_ssl:setopts(NewSocket, [{packet, line}, binary]),
+            {ok, State#state{
+                socket = NewSocket,
+                transport = ranch_ssl,
+                envelope = undefined,
+                authdata = undefined,
+                waitingauth = false,
+                readmessage = false,
+                tls = true,
+                callbackstate = Module:handle_STARTTLS(OldCallbackState)
+            }};
+        {error, Reason} ->
+            ?LOG_INFO("SSL handshake failed : ~p", [Reason], ?LOGGER_META),
+            %XXX: MSG-3078 — if the peer is gone, the 454 reply cannot be
+            %XXX: delivered; end the session gracefully instead of crashing
+            %XXX: with {stop, {send_error, closed}}. On a successful send the
+            %XXX: existing ssl_handshake_error handling applies unchanged.
+            try send(State, "454 TLS negotiation failed\r\n") of
+                ok ->
+                    State1 = handle_error(ssl_handshake_error, Reason, State),
+                    {ok, State1}
+            catch
+                {stop, {send_error, Err}, St1} when
+                    Err == closed; Err == tcp_closed
+                ->
+                    ?LOG_INFO("Peer closed during STARTTLS negotiation", ?LOGGER_META),
+                    {stop, normal, St1}
+            end
+    end.
 
 decode_auth_line(Line) ->
     try base64:decode(Line) of
